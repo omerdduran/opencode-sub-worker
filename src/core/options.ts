@@ -1,14 +1,69 @@
 /**
- * Plugin options: defaults and normalization. Invalid values fall back to
- * defaults so a misconfiguration can never break the host.
+ * Plugin options: defaults, normalization and limit resolution. Invalid values
+ * fall back to defaults so a misconfiguration can never break the host.
  */
 
 import { DEFAULT_COMMAND_NAME, DEFAULT_STATE_PATH, DEFAULT_WORKER_AGENT } from "./constants.ts"
+import type { ParseResult } from "./types.ts"
+
+/** Which task-list format to parse. */
+export type TaskFormat = "checklist" | "headings"
+
+/** How a run integrates finished work. `assist` leaves the tree dirty (do-work style). */
+export type RunMode = "integrate" | "assist"
+
+/** Label names (lowercased) that carry each task field in the `headings` format. */
+export interface FieldMap {
+  files: string[]
+  verify: string[]
+  deps: string[]
+  agent: string[]
+  model: string[]
+  locks: string[]
+  priority: string[]
+  risk: string[]
+  whatToBuild: string[]
+  acceptance: string[]
+  outOfScope: string[]
+  spec: string[]
+  stories: string[]
+  tdd: string[]
+}
+
+export const DEFAULT_FIELDS: FieldMap = {
+  files: ["files"],
+  verify: ["verify"],
+  deps: ["deps", "depends on"],
+  agent: ["agent"],
+  model: ["model"],
+  locks: ["locks"],
+  priority: ["priority"],
+  risk: ["risk"],
+  whatToBuild: ["what to build"],
+  acceptance: ["acceptance criteria"],
+  outOfScope: ["out of scope"],
+  spec: ["spec & identifiers in scope", "spec"],
+  stories: ["stories"],
+  tdd: ["tdd"],
+}
+
+export type CustomParser = (source: string) => ParseResult
 
 export interface PluginOptions {
   commandName: string
   registerCommand: boolean
   registerTools: boolean
+
+  /** Task-list format. */
+  taskFormat: TaskFormat
+  /** Field-label mapping for the `headings` format. */
+  fields: FieldMap
+  /** Treat file order as the dependency chain (no explicit deps). */
+  sequentialDeps: boolean
+  /** Path to a JS module exporting a custom parser. */
+  parserModule: string
+  /** Resolved custom parser (set from `parserModule`, not from JSON). */
+  customParser?: CustomParser
 
   /** Upper bound on concurrently running workers. */
   maxConcurrency: number
@@ -35,6 +90,14 @@ export interface PluginOptions {
   roleModels: Record<string, string>
   /** Ordered fallback model references tried on retry after a failure. */
   fallbackModels: string[]
+  /** Extra worker instructions appended to every worker prompt. */
+  workerInstructions: string
+  /** A file whose contents are appended to every worker prompt. */
+  workerInstructionsFile: string
+  /** Skills the worker should follow (appended to the prompt). */
+  workerSkills: string[]
+  /** The built-in worker report contract. `none` omits it. */
+  workerContract: "generic" | "none"
 
   /** Create a git worktree per worker. When false, workers share the project. */
   useWorktrees: boolean
@@ -58,13 +121,27 @@ export interface PluginOptions {
   coChangeLearning: boolean
   /** Minimum co-change count before a learned pair conflicts. */
   coChangeMinCount: number
+  /** Hold tasks whose body matches any of these regexes (checked before running). */
+  holdPattern: string[]
   /** Mirror run/task status into the orchestrator session title. */
   mirrorSessionTitles: boolean
+
+  /** How finished tasks are detected. */
+  detectCompletion: "report" | "checkboxes"
+  /** Append a per-task block to this file (relative to the project root). */
+  progressFile: string
+  /** Write `[x]` back to the source list when a task is done. */
+  flipCheckboxes: boolean
+
+  /** Run in `integrate` (merge) or `assist` (leave the tree dirty) mode. */
+  mode: RunMode
 
   /** Run an independent read-only verifier session after the gate passes. */
   verifierEnabled: boolean
   /** Agent id used for the verifier session. */
   verifierAgent: string
+  /** Extra verifier instructions appended to the verifier prompt. */
+  verifierPrompt: string
 
   /** When a worker reports blocked, pause and wait for an answer instead of disposing it. */
   askUserOnBlocked: boolean
@@ -83,6 +160,11 @@ export const DEFAULT_OPTIONS: PluginOptions = {
   registerCommand: true,
   registerTools: true,
 
+  taskFormat: "checklist",
+  fields: DEFAULT_FIELDS,
+  sequentialDeps: false,
+  parserModule: "",
+
   maxConcurrency: 3,
   taskTimeoutMs: 20 * 60_000,
   verifyTimeoutMs: 10 * 60_000,
@@ -96,6 +178,10 @@ export const DEFAULT_OPTIONS: PluginOptions = {
   workerModel: "",
   roleModels: {},
   fallbackModels: [],
+  workerInstructions: "",
+  workerInstructionsFile: "",
+  workerSkills: [],
+  workerContract: "generic",
 
   useWorktrees: true,
   requireWorktrees: true,
@@ -109,10 +195,18 @@ export const DEFAULT_OPTIONS: PluginOptions = {
   approvalRisks: [],
   coChangeLearning: false,
   coChangeMinCount: 2,
+  holdPattern: ["\\[NEEDS DECISION"],
   mirrorSessionTitles: false,
+
+  detectCompletion: "report",
+  progressFile: "",
+  flipCheckboxes: false,
+
+  mode: "integrate",
 
   verifierEnabled: false,
   verifierAgent: "explore",
+  verifierPrompt: "",
 
   askUserOnBlocked: false,
 
@@ -148,16 +242,36 @@ function roleModels(raw: unknown): Record<string, string> {
 }
 
 function strArray(raw: unknown): string[] {
+  if (typeof raw === "string" && raw.trim().length > 0) return [raw.trim()]
   if (!Array.isArray(raw)) return []
   return raw.filter((x): x is string => typeof x === "string" && x.trim().length > 0).map((x) => x.trim())
 }
 
+function labelList(raw: unknown, fallback: string[]): string[] {
+  const list = strArray(raw).map((s) => s.toLowerCase())
+  return list.length > 0 ? list : fallback
+}
+
+function fieldMap(raw: unknown): FieldMap {
+  const source = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>
+  const out = { ...DEFAULT_FIELDS }
+  for (const key of Object.keys(DEFAULT_FIELDS) as Array<keyof FieldMap>) {
+    if (key in source) out[key] = labelList(source[key], DEFAULT_FIELDS[key])
+  }
+  return out
+}
+
 export function normalizeOptions(raw: unknown): PluginOptions {
   const o = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>
-  return {
+  const options: PluginOptions = {
     commandName: str(o["commandName"], DEFAULT_OPTIONS.commandName).replace(/^\/+/, ""),
     registerCommand: bool(o["registerCommand"], DEFAULT_OPTIONS.registerCommand),
     registerTools: bool(o["registerTools"], DEFAULT_OPTIONS.registerTools),
+
+    taskFormat: o["taskFormat"] === "headings" ? "headings" : "checklist",
+    fields: fieldMap(o["fields"]),
+    sequentialDeps: bool(o["sequentialDeps"], DEFAULT_OPTIONS.sequentialDeps),
+    parserModule: typeof o["parserModule"] === "string" ? o["parserModule"].trim() : DEFAULT_OPTIONS.parserModule,
 
     maxConcurrency: num(o["maxConcurrency"], DEFAULT_OPTIONS.maxConcurrency, { min: 1, integer: true }),
     taskTimeoutMs: num(o["taskTimeoutMs"], DEFAULT_OPTIONS.taskTimeoutMs, { min: 1 }),
@@ -172,6 +286,11 @@ export function normalizeOptions(raw: unknown): PluginOptions {
     workerModel: typeof o["workerModel"] === "string" ? o["workerModel"].trim() : DEFAULT_OPTIONS.workerModel,
     roleModels: roleModels(o["roleModels"]),
     fallbackModels: strArray(o["fallbackModels"]),
+    workerInstructions: typeof o["workerInstructions"] === "string" ? o["workerInstructions"] : DEFAULT_OPTIONS.workerInstructions,
+    workerInstructionsFile:
+      typeof o["workerInstructionsFile"] === "string" ? o["workerInstructionsFile"].trim() : DEFAULT_OPTIONS.workerInstructionsFile,
+    workerSkills: strArray(o["workerSkills"]),
+    workerContract: o["workerContract"] === "none" ? "none" : "generic",
 
     useWorktrees: bool(o["useWorktrees"], DEFAULT_OPTIONS.useWorktrees),
     requireWorktrees: bool(o["requireWorktrees"], DEFAULT_OPTIONS.requireWorktrees),
@@ -185,10 +304,18 @@ export function normalizeOptions(raw: unknown): PluginOptions {
     approvalRisks: strArray(o["approvalRisks"]),
     coChangeLearning: bool(o["coChangeLearning"], DEFAULT_OPTIONS.coChangeLearning),
     coChangeMinCount: num(o["coChangeMinCount"], DEFAULT_OPTIONS.coChangeMinCount, { min: 1, integer: true }),
+    holdPattern: Array.isArray(o["holdPattern"]) ? strArray(o["holdPattern"]) : DEFAULT_OPTIONS.holdPattern,
     mirrorSessionTitles: bool(o["mirrorSessionTitles"], DEFAULT_OPTIONS.mirrorSessionTitles),
+
+    detectCompletion: o["detectCompletion"] === "checkboxes" ? "checkboxes" : "report",
+    progressFile: typeof o["progressFile"] === "string" ? o["progressFile"].trim() : DEFAULT_OPTIONS.progressFile,
+    flipCheckboxes: bool(o["flipCheckboxes"], DEFAULT_OPTIONS.flipCheckboxes),
+
+    mode: o["mode"] === "assist" ? "assist" : "integrate",
 
     verifierEnabled: bool(o["verifierEnabled"], DEFAULT_OPTIONS.verifierEnabled),
     verifierAgent: str(o["verifierAgent"], DEFAULT_OPTIONS.verifierAgent),
+    verifierPrompt: typeof o["verifierPrompt"] === "string" ? o["verifierPrompt"] : DEFAULT_OPTIONS.verifierPrompt,
 
     askUserOnBlocked: bool(o["askUserOnBlocked"], DEFAULT_OPTIONS.askUserOnBlocked),
 
@@ -198,6 +325,16 @@ export function normalizeOptions(raw: unknown): PluginOptions {
     persistState: bool(o["persistState"], DEFAULT_OPTIONS.persistState),
     stateFilePath: str(o["stateFilePath"], DEFAULT_OPTIONS.stateFilePath),
   }
+
+  // `assist` mode leaves the tree dirty for a human (or an external committer),
+  // so it forces the merging behaviours off.
+  if (options.mode === "assist") {
+    options.autoMerge = false
+    options.commitBeforeMerge = false
+    options.cleanupWorktrees = false
+  }
+
+  return options
 }
 
 /** Resolve the model reference for a task: task override, then role map, then default. */

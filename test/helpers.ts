@@ -108,6 +108,23 @@ export class FakeHost implements HostPort {
     this.titles.push({ sessionID, title })
   }
 
+  /** In-memory text files backing readText/writeText/appendText. */
+  readonly files = new Map<string, string>()
+  readonly appends: Array<{ path: string; content: string }> = []
+
+  async readText(path: string): Promise<string | undefined> {
+    return this.files.get(path)
+  }
+
+  async writeText(path: string, content: string): Promise<void> {
+    this.files.set(path, content)
+  }
+
+  async appendText(path: string, content: string): Promise<void> {
+    this.files.set(path, (this.files.get(path) ?? "") + content)
+    this.appends.push({ path, content })
+  }
+
   async commitWorktree(directory: string, message: string): Promise<MergeResult> {
     this.commits.push({ directory, message })
     return this.commitOk ? { ok: true, output: "" } : { ok: false, output: "commit failed" }

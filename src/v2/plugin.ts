@@ -6,8 +6,10 @@
  * `add`), so the worker agent is installed as a markdown file on setup.
  */
 
+import { isAbsolute, resolve } from "node:path"
+import { pathToFileURL } from "node:url"
 import { Engine, type EngineEvent } from "../core/engine.ts"
-import { normalizeOptions } from "../core/options.ts"
+import { normalizeOptions, type CustomParser } from "../core/options.ts"
 import { control } from "../core/prompt.ts"
 import { SubWorker } from "../rpc.ts"
 import type { V2Context, V2ToolContext } from "./context.ts"
@@ -139,6 +141,39 @@ export async function setupV2(rawCtx: unknown): Promise<() => Promise<void>> {
 
   const options = normalizeOptions(ctx.options ?? {})
   const port = createV2Port(ctx)
+
+  // Optional custom parser module (absolute path, relative path or package name).
+  if (options.parserModule.length > 0) {
+    try {
+      const mod = options.parserModule
+      const spec =
+        mod.startsWith("file:") || mod.startsWith(".") || mod.startsWith("/")
+          ? pathToFileURL(isAbsolute(mod) ? mod : resolve(port.baseDirectory, mod)).href
+          : mod
+      const loaded = (await import(spec)) as { parse?: CustomParser; default?: CustomParser }
+      const custom = loaded.parse ?? loaded.default
+      if (typeof custom === "function") options.customParser = custom
+    } catch (err) {
+      await port.log("warn", "could not load parserModule", { error: String(err) })
+    }
+  }
+
+  // Optional worker instruction file appended to every worker prompt.
+  if (options.workerInstructionsFile.length > 0) {
+    try {
+      const path = isAbsolute(options.workerInstructionsFile)
+        ? options.workerInstructionsFile
+        : resolve(port.baseDirectory, options.workerInstructionsFile)
+      const text = await port.readText(path)
+      if (text && text.trim().length > 0) {
+        options.workerInstructions = [options.workerInstructions, text.trim()]
+          .filter((s) => s.length > 0)
+          .join("\n\n")
+      }
+    } catch (err) {
+      await port.log("warn", "could not read workerInstructionsFile", { error: String(err) })
+    }
+  }
 
   // The engine emits events before the RPC registration exists; route them
   // through a mutable sink that the registration fills in below.

@@ -84,6 +84,13 @@ export interface HostPort {
   /** Set a session title (cosmetic status mirroring). */
   setSessionTitle(sessionID: string, title: string): Promise<void>
 
+  /** Read a UTF-8 text file. Resolves undefined when it does not exist or is unreadable. */
+  readText(path: string): Promise<string | undefined>
+  /** Write a UTF-8 text file, creating parent directories. */
+  writeText(path: string, content: string): Promise<void>
+  /** Append to a UTF-8 text file, creating it (and its parent directories) if needed. */
+  appendText(path: string, content: string): Promise<void>
+
   /** Create and prompt a worker session. */
   spawnWorker(spec: WorkerSpec): Promise<WorkerHandle>
   /** Wait until the worker session is idle (or errors). */

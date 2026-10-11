@@ -5,8 +5,8 @@
  */
 
 import { exec } from "node:child_process"
-import { mkdir, readFile, writeFile } from "node:fs/promises"
-import { isAbsolute, join, resolve } from "node:path"
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises"
+import { dirname, isAbsolute, join, resolve } from "node:path"
 import { CONTROL_MARKER, DONE_MARKER, BLOCKED_MARKER, WORK_MARKER } from "../core/constants.ts"
 import type {
   GateResult,
@@ -305,6 +305,24 @@ export function createV2Port(ctx: V2Context): HostPort {
       } catch {
         // cosmetic only
       }
+    },
+
+    async readText(path: string): Promise<string | undefined> {
+      try {
+        return await readFile(path, "utf8")
+      } catch {
+        return undefined
+      }
+    },
+
+    async writeText(path: string, content: string): Promise<void> {
+      await mkdir(dirname(path), { recursive: true })
+      await writeFile(path, content, "utf8")
+    },
+
+    async appendText(path: string, content: string): Promise<void> {
+      await mkdir(dirname(path), { recursive: true })
+      await appendFile(path, content, "utf8")
     },
 
     async sendWorkerMessage(sessionID: string, text: string): Promise<void> {

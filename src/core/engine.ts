@@ -10,8 +10,9 @@
  */
 
 import { parseChecklist } from "./parser.ts"
+import { parseHeadings } from "./parse-headings.ts"
 import { findCycle, previewWaves, type ConflictPredicate } from "./graph.ts"
-import { activeCount, hasPending, nextBatch, propagateSkips } from "./scheduler.ts"
+import { activeCount, hasPending, isSettled, nextBatch, propagateSkips } from "./scheduler.ts"
 import {
   buildRepairPrompt,
   buildVerifierPrompt,
@@ -24,7 +25,7 @@ import { makeRun, RunStore } from "./state.ts"
 import { matchesAny } from "./glob.ts"
 import { CoChangeStore } from "./cochange.ts"
 import { resolveModelRef, type PluginOptions } from "./options.ts"
-import type { MailboxMessage, RunState, Task } from "./types.ts"
+import type { MailboxMessage, ParseResult, RunState, Task } from "./types.ts"
 import { CONTROL_MARKER } from "./constants.ts"
 import type { HostPort, PermissionRule, WorkerSpec } from "../ports.ts"
 
@@ -83,6 +84,51 @@ export class Engine {
     return `${run.id}:${task.id}`
   }
 
+  /**
+   * Parse a task list with the configured adapter, then apply the cross-cutting
+   * rules: `sequentialDeps` turns file order into the dependency chain and
+   * `holdPattern` holds a task that carries an open decision marker.
+   */
+  private prepare(source: string): ParseResult & { meta?: Record<string, string> } {
+    let result: ParseResult & { meta?: Record<string, string> }
+    if (this.options.customParser) {
+      result = this.options.customParser(source)
+    } else if (this.options.taskFormat === "headings") {
+      result = parseHeadings(source, this.options.fields)
+    } else {
+      result = parseChecklist(source)
+    }
+
+    if (this.options.sequentialDeps) {
+      let previous: string | undefined
+      for (const t of result.tasks) {
+        if (t.deps.length === 0 && previous !== undefined) t.deps = [previous]
+        previous = t.id
+      }
+    }
+
+    if (this.options.holdPattern.length > 0) {
+      const patterns: RegExp[] = []
+      for (const p of this.options.holdPattern) {
+        try {
+          patterns.push(new RegExp(p, "i"))
+        } catch {
+          // ignore an invalid pattern
+        }
+      }
+      for (const t of result.tasks) {
+        const body = t.raw ?? `${t.title} ${t.whatToBuild ?? ""}`
+        const hit = patterns.find((re) => re.test(body))
+        if (hit) {
+          t.held = true
+          t.holdReason = `matched /${hit.source}/`
+        }
+      }
+    }
+
+    return result
+  }
+
   private emit(event: EngineEvent): void {
     try {
       this.onEvent?.(event)
@@ -106,7 +152,7 @@ export class Engine {
   // ---- planning ---------------------------------------------------------
 
   planText(source: string, label: string): string {
-    const { tasks, errors } = parseChecklist(source)
+    const { tasks, errors } = this.prepare(source)
     const preview = previewWaves(tasks, this.conflictExtra())
     const lines: string[] = [`Tasks (${tasks.length}) from ${label}:`]
     for (const t of tasks) {
@@ -119,6 +165,8 @@ export class Engine {
       if (t.model) bits.push(`model: ${t.model}`)
       if (t.priority) bits.push(`priority: ${t.priority}`)
       if (t.risk) bits.push(`risk: ${t.risk}`)
+      if (t.held) bits.push(`HELD ${t.holdReason ?? ""}`.trim())
+      if (t.design) bits.push("design")
       lines.push(
         `  ${t.index}. [${t.checkedInSource ? "x" : " "}] ${t.title}${bits.length > 0 ? ` — ${bits.join(" | ")}` : ""}`,
       )
@@ -159,7 +207,8 @@ export class Engine {
   // ---- lifecycle --------------------------------------------------------
 
   async start(sessionID: string, source: string, label: string): Promise<RunState> {
-    const { tasks } = parseChecklist(source)
+    const parsed = this.prepare(source)
+    const { tasks } = parsed
     const cycle = findCycle(tasks)
     if (cycle.length > 0) {
       throw new Error(`dependency cycle detected, refusing to run: ${cycle.join(" -> ")}`)
@@ -181,6 +230,7 @@ export class Engine {
       this.now(),
       { maxCostUsd: this.options.maxCostUsd, maxTokens: this.options.maxTokens },
     )
+    if (parsed.meta && Object.keys(parsed.meta).length > 0) run.meta = parsed.meta
     this.store.add(run)
     this.store.history(run, "started", `${tasks.length} task(s) from ${label}`, this.now())
     await this.persist()
@@ -194,7 +244,7 @@ export class Engine {
   async add(sessionID: string, source: string, label: string): Promise<RunState | undefined> {
     const run = this.store.active(sessionID)
     if (!run) return undefined
-    const { tasks } = parseChecklist(source)
+    const { tasks } = this.prepare(source)
     const existing = this.byId(run)
     for (const t of tasks) {
       if (existing.has(t.id)) {
@@ -423,8 +473,16 @@ export class Engine {
 
       if (activeCount(run.tasks) === 0) {
         if (hasPending(run.tasks)) {
-          this.store.setStatus(run, "paused", "no runnable tasks (dependency deadlock)", this.now())
-          await this.port.notify("Sub-worker run paused: no runnable tasks.")
+          const settled = new Set(run.tasks.filter((t) => isSettled(t.status)).map((t) => t.id))
+          const held = run.tasks.filter(
+            (t) => t.status === "pending" && t.held && t.deps.every((d) => settled.has(d)),
+          )
+          const reason =
+            held.length > 0
+              ? `held: ${held.map((t) => `${t.id} (${t.holdReason ?? "decision needed"})`).join(", ")}`
+              : "no runnable tasks (dependency deadlock)"
+          this.store.setStatus(run, "paused", reason, this.now())
+          await this.port.notify(`Sub-worker run paused: ${reason}`)
         } else {
           const bad = run.tasks.filter((t) => t.status === "failed" || t.status === "blocked")
           if (bad.length > 0) this.store.setStatus(run, "failed", `${bad.length} task(s) not completed`, this.now())
@@ -504,7 +562,15 @@ export class Engine {
     const spec: WorkerSpec = {
       taskID: task.id,
       title: task.title,
-      prompt: buildWorkerPrompt(task, this.port.baseDirectory, task.lastError),
+      prompt: buildWorkerPrompt(task, {
+        projectDir: this.port.baseDirectory,
+        ...(task.lastError !== undefined ? { previousError: task.lastError } : {}),
+        ...(this.options.workerInstructions.trim().length > 0
+          ? { instructions: this.options.workerInstructions }
+          : {}),
+        ...(this.options.workerSkills.length > 0 ? { skills: this.options.workerSkills } : {}),
+        contract: this.options.workerContract,
+      }),
       directory,
       isolated,
       parentSessionID: run.sessionID,
@@ -582,6 +648,23 @@ export class Engine {
       return
     }
 
+    // Completion detection: in `checkboxes` mode the worker is expected to have
+    // flipped the task's checkbox in the source list (a do-work style flow).
+    if (this.options.detectCompletion === "checkboxes") {
+      const checked = await this.isCheckedOff(run, task)
+      if (checked === false) {
+        await this.safeDispose(sessionID)
+        task.sessionID = undefined
+        await this.handleFailure(run, task, `task ${task.id} was not checked off in ${run.sourceLabel}`)
+        return
+      }
+      if (checked === undefined) {
+        await this.port.log("warn", "could not read the source list for checkbox detection", {
+          source: run.sourceLabel,
+        })
+      }
+    }
+
     // Collect the changed files once: used for the diff-scope check and learning.
     let changed: string[] = []
     if (task.worktree) changed = await this.changedFiles(task.worktree)
@@ -655,6 +738,8 @@ export class Engine {
     task.endedAt = this.now()
     this.store.history(run, "done", `${task.id}: ${summarize(task.evidence, 160)}`, this.now())
     this.emit({ type: "task.done", runID: run.id, taskID: task.id })
+    if (this.options.flipCheckboxes) await this.flipSourceCheckbox(run, task)
+    if (this.options.progressFile.length > 0) await this.appendProgress(run, task)
     await this.integrate(run, task)
   }
 
@@ -678,7 +763,7 @@ export class Engine {
     const spec: WorkerSpec = {
       taskID: `verify-${task.id}`,
       title: `verify ${task.id}`,
-      prompt: buildVerifierPrompt(task),
+      prompt: buildVerifierPrompt(task, this.options.verifierPrompt || undefined),
       directory: task.worktree ?? this.port.baseDirectory,
       isolated: task.worktree !== undefined,
       parentSessionID: run.sessionID,
@@ -705,6 +790,61 @@ export class Engine {
       await this.port.log("warn", "could not read changed files", { error: String(err) })
       return []
     }
+  }
+
+  private sourcePath(run: RunState): string | undefined {
+    const label = run.sourceLabel
+    if (label.length === 0 || label === "inline") return undefined
+    if (label.startsWith("/")) return label
+    const base = run.projectDir.replace(/\/+$/, "")
+    return `${base}/${label.replace(/^\.\//, "")}`
+  }
+
+  private projectPath(run: RunState, relative: string): string {
+    if (relative.startsWith("/")) return relative
+    const base = run.projectDir.replace(/\/+$/, "")
+    return `${base}/${relative.replace(/^\.\//, "")}`
+  }
+
+  /** True when the task's checkbox is checked in the source list; undefined when unreadable. */
+  private async isCheckedOff(run: RunState, task: Task): Promise<boolean | undefined> {
+    const path = this.sourcePath(run)
+    if (!path) return undefined
+    const content = await this.port.readText(path)
+    if (content === undefined) return undefined
+    const parsed = this.prepare(content)
+    const found = parsed.tasks.find((t) => t.id === task.id)
+    return found ? found.checkedInSource : undefined
+  }
+
+  private async flipSourceCheckbox(run: RunState, task: Task): Promise<void> {
+    const path = this.sourcePath(run)
+    if (!path) return
+    const content = await this.port.readText(path)
+    if (content === undefined) return
+    let updated = content
+    if (this.options.taskFormat === "headings") {
+      const re = new RegExp(`^(#{3,}\\s+${escapeRe(task.id)}[.)]?\\s*\\[)([ ])(\\])`, "m")
+      updated = content.replace(re, "$1x$3")
+    } else {
+      const firstLine = (task.raw ?? "").split("\n")[0] ?? ""
+      if (firstLine.includes("[ ]")) {
+        updated = content.replace(firstLine, firstLine.replace("[ ]", "[x]"))
+      }
+    }
+    if (updated !== content) {
+      await this.port.writeText(path, updated)
+      this.store.history(run, "checked-off", task.id, this.now())
+    }
+  }
+
+  private async appendProgress(run: RunState, task: Task): Promise<void> {
+    const path = this.projectPath(run, this.options.progressFile)
+    const date = new Date(this.now()).toISOString().slice(0, 10)
+    const lines = ["", `## ${task.id}: ${task.title} (${date})`, "", "- **Status:** done"]
+    if (task.evidence) lines.push(`- **Evidence:** ${summarize(task.evidence, 500)}`)
+    lines.push("")
+    await this.port.appendText(path, lines.join("\n"))
   }
 
   private async integrate(run: RunState, task: Task): Promise<void> {
@@ -935,6 +1075,7 @@ export class Engine {
       if (t.branch) extras.push(`branch ${t.branch}`)
       else if (t.worktree) extras.push("worktree")
       if (t.priority) extras.push(`prio ${t.priority}`)
+      if (t.held) extras.push("held")
       if (t.attempts > 0) extras.push(`attempts=${t.attempts}`)
       if (t.repairs) extras.push(`repairs=${t.repairs}`)
       if (t.cost !== undefined && t.cost > 0) extras.push(`$${t.cost.toFixed(4)}`)
@@ -1069,6 +1210,10 @@ function statusMark(status: Task["status"]): string {
 
 export function parseModel(ref: string): { providerID: string; modelID: string; variant?: string } | undefined {
   return parseModelRef(ref)
+}
+
+function escapeRe(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
 
 export function parseModelRef(

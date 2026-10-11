@@ -34,6 +34,25 @@ export interface Task {
   locks?: string[]
   /** Higher runs first among ready tasks. Default 0. */
   priority?: number
+  /** PRD user-story numbers this task covers (headings format). */
+  stories?: number[]
+  /** "yes" or "no (<reason>)" (headings format). */
+  tdd?: string
+  /** A visual subtask marker (headings format `[design]`). */
+  design?: boolean
+  /** Prose context carried into the worker prompt. */
+  whatToBuild?: string
+  /** Prose context carried into the worker prompt. */
+  outOfScope?: string[]
+  /** Spec sections this task must respect. */
+  spec?: string
+  /** Acceptance criteria checkboxes (headings format). */
+  acceptance?: string[]
+  /** Held back from running (e.g. an open decision marker). */
+  held?: boolean
+  holdReason?: string
+  /** The raw source block for this task (used for hold detection and context). */
+  raw?: string
   /** Verification command. `null` means the task has no gate. */
   verify: string | null
   /** Resolved dependency ids. */
@@ -102,6 +121,8 @@ export interface RunState {
   source: string
   /** Human label for the source (file path or "inline"). */
   sourceLabel: string
+  /** Frontmatter / metadata carried from the source. */
+  meta?: Record<string, string>
   projectDir: string
   tasks: Task[]
   status: RunStatus

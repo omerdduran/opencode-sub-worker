@@ -31,10 +31,12 @@ export {
   isPluginOwnedText,
 } from "./constants.ts"
 
-export { normalizeOptions, DEFAULT_OPTIONS, resolveModelRef } from "./options.ts"
-export type { PluginOptions } from "./options.ts"
+export { normalizeOptions, DEFAULT_OPTIONS, DEFAULT_FIELDS, resolveModelRef } from "./options.ts"
+export type { PluginOptions, FieldMap, TaskFormat, RunMode, CustomParser } from "./options.ts"
 
 export { parseChecklist } from "./parser.ts"
+export { parseHeadings } from "./parse-headings.ts"
+export type { HeadingParseResult } from "./parse-headings.ts"
 export { buildGraph, conflicts, findCycle, previewWaves } from "./graph.ts"
 export { specConflicts, pathMatchesGlob, matchesAny, globToRegExp, hasGlob } from "./glob.ts"
 export {
@@ -57,5 +59,6 @@ export {
   control,
   summarize,
 } from "./prompt.ts"
+export type { WorkerPromptContext } from "./prompt.ts"
 export { Engine, parseModel, parseModelRef } from "./engine.ts"
 export type { ReportInput, EngineEvent } from "./engine.ts"

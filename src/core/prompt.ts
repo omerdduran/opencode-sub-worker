@@ -4,7 +4,8 @@
  * Workers are ordinary sessions. The orchestrator cannot assume a tool it
  * registered is visible inside a worker's worktree location, so the durable
  * contract is a report at the end of the worker's final message: a fenced JSON
- * block, with the bracket markers kept as a fallback.
+ * block, with the bracket markers kept as a fallback. Projects can inject their
+ * own instructions, skills and even replace the report contract.
  */
 
 import { BLOCKED_MARKER, CONTROL_MARKER, DONE_MARKER, WORK_MARKER } from "./constants.ts"
@@ -14,6 +15,17 @@ export interface WorkerOutcome {
   kind: "done" | "blocked" | "unknown"
   evidence: string
   blocker: string
+}
+
+export interface WorkerPromptContext {
+  projectDir: string
+  previousError?: string
+  /** Project-specific instructions appended after the scope/verify sections. */
+  instructions?: string
+  /** Skills the worker should follow. */
+  skills?: string[]
+  /** `none` omits the built-in report contract. */
+  contract?: "generic" | "none"
 }
 
 const REPORT_INSTRUCTIONS = [
@@ -28,13 +40,31 @@ const REPORT_INSTRUCTIONS = [
   `(If you cannot produce JSON, the line "${DONE_MARKER} <evidence>" or "${BLOCKED_MARKER} <blocker>" also works.)`,
 ]
 
-export function buildWorkerPrompt(task: Task, projectDir: string, previousError?: string): string {
+export function buildWorkerPrompt(task: Task, ctx: WorkerPromptContext): string {
   const lines: string[] = []
   lines.push(`${WORK_MARKER} task ${task.id}: ${task.title}`)
   lines.push("")
   lines.push(
     "You are a worker for one task in an orchestrated run. Your working directory is the isolated checkout provided by the session.",
   )
+  if (task.whatToBuild) {
+    lines.push("")
+    lines.push("What to build:")
+    lines.push(task.whatToBuild)
+  }
+  if (task.spec) {
+    lines.push("")
+    lines.push(`Spec in scope: ${task.spec}`)
+  }
+  if (task.outOfScope && task.outOfScope.length > 0) {
+    lines.push("")
+    lines.push(`Out of scope: ${task.outOfScope.join("; ")}`)
+  }
+  if (task.stories && task.stories.length > 0) {
+    lines.push(`Stories: ${task.stories.join(", ")}`)
+  }
+  if (task.tdd) lines.push(`TDD: ${task.tdd}`)
+  if (task.design) lines.push("This is a visual subtask; follow the project's design canon.")
   if (task.files.length > 0) {
     lines.push("")
     lines.push("Write scope — only create or modify these paths:")
@@ -48,20 +78,36 @@ export function buildWorkerPrompt(task: Task, projectDir: string, previousError?
     lines.push("")
     lines.push(`This task holds these exclusive locks: ${task.locks.join(", ")}`)
   }
+  if (task.acceptance && task.acceptance.length > 0) {
+    lines.push("")
+    lines.push("Acceptance criteria:")
+    for (const item of task.acceptance) lines.push(`  - [ ] ${item}`)
+  }
   if (task.verify) {
     lines.push("")
     lines.push("Before finishing, run this verification command from the task directory and make it pass:")
     lines.push(`  ${task.verify}`)
   }
-  if (previousError) {
+  if (ctx.skills && ctx.skills.length > 0) {
+    lines.push("")
+    lines.push("Follow the guidance of these skills:")
+    for (const s of ctx.skills) lines.push(`  - ${s}`)
+  }
+  if (ctx.instructions && ctx.instructions.trim().length > 0) {
+    lines.push("")
+    lines.push(ctx.instructions.trim())
+  }
+  if (ctx.previousError) {
     lines.push("")
     lines.push("A previous attempt failed. Address this before finishing:")
-    lines.push(previousError.slice(0, 4000))
+    lines.push(ctx.previousError.slice(0, 4000))
+  }
+  if ((ctx.contract ?? "generic") !== "none") {
+    lines.push("")
+    for (const line of REPORT_INSTRUCTIONS) lines.push(line)
   }
   lines.push("")
-  for (const line of REPORT_INSTRUCTIONS) lines.push(line)
-  lines.push("")
-  lines.push(`Base project directory (for reference, do not edit outside your checkout): ${projectDir}`)
+  lines.push(`Base project directory (for reference, do not edit outside your checkout): ${ctx.projectDir}`)
   return lines.join("\n")
 }
 
@@ -86,7 +132,7 @@ export function buildRepairPrompt(task: Task, failure: string): string {
 }
 
 /** Prompt for an independent, read-only verifier session. */
-export function buildVerifierPrompt(task: Task): string {
+export function buildVerifierPrompt(task: Task, extra?: string): string {
   const lines: string[] = []
   lines.push(`${WORK_MARKER} verify ${task.id}: ${task.title}`)
   lines.push("")
@@ -94,10 +140,23 @@ export function buildVerifierPrompt(task: Task): string {
   lines.push(
     "Inspect the working tree changes in this checkout and judge whether the task was completed correctly and whether it stayed within its declared write scope.",
   )
+  if (task.whatToBuild) {
+    lines.push("")
+    lines.push(`The task was meant to: ${task.whatToBuild}`)
+  }
   if (task.files.length > 0) {
     lines.push("")
     lines.push("Declared write scope:")
     for (const f of task.files) lines.push(`  - ${f}`)
+  }
+  if (task.acceptance && task.acceptance.length > 0) {
+    lines.push("")
+    lines.push("Acceptance criteria:")
+    for (const item of task.acceptance) lines.push(`  - ${item}`)
+  }
+  if (extra && extra.trim().length > 0) {
+    lines.push("")
+    lines.push(extra.trim())
   }
   lines.push("")
   for (const line of REPORT_INSTRUCTIONS) lines.push(line)

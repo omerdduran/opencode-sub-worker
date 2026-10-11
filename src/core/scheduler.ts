@@ -25,7 +25,9 @@ export function nextBatch(tasks: Task[], maxConcurrency: number, extra?: Conflic
   if (free <= 0) return []
 
   const done = new Set(tasks.filter((t) => isSettled(t.status)).map((t) => t.id))
-  const candidates = tasks.filter((t) => t.status === "pending" && t.deps.every((d) => done.has(d)))
+  const candidates = tasks.filter(
+    (t) => t.status === "pending" && !t.held && t.deps.every((d) => done.has(d)),
+  )
   candidates.sort((x, y) => (y.priority ?? 0) - (x.priority ?? 0) || x.index - y.index)
 
   const busy: Task[] = [...running]

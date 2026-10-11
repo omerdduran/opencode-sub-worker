@@ -45,8 +45,8 @@ into **deterministic code**:
 
 ## How it works
 
-1. **Parse** — every `- [ ]` / `- [x]` line is a task; indented `key: value`
-   lines attach metadata.
+1. **Parse** — a `checklist` line (`- [ ]`) or a `headings` task (`### N. [ ]`),
+   depending on `taskFormat`; a custom parser can be plugged in.
 2. **Graph** — `deps:` become ordering edges; tasks that share a file (or
    declare no files at all) become mutually exclusive.
 3. **Schedule** — ready, non-conflicting tasks are launched up to
@@ -65,7 +65,11 @@ If a task exhausts its retries, or reports blocked, or its gate keeps failing,
 the run **pauses** and the user is notified. `/tasks resume` gives it another
 shot.
 
-## Task format
+## Task formats
+
+Two formats are built in; pick one with `taskFormat`.
+
+### `checklist` (default)
 
 A task is a checklist line. Metadata goes on the lines below it, indented at
 least as far as the task, with or without a bullet.
@@ -86,6 +90,76 @@ least as far as the task, with or without a bullet.
 Already-checked (`- [x]`) items are treated as done and satisfy dependents.
 
 Example: [`examples/tasks.example.md`](examples/tasks.example.md).
+
+### `headings` (PRD / `tasks.md` style)
+
+A task is a `### N. [ ]` heading; fields are bold labels below it; the order in
+the file is the dependency chain. `[design]` marks a visual subtask.
+
+```md
+### 1. [ ] Add the cache layer
+- **Stories:** 1, 3
+- **TDD:** yes
+- **Risk:** 🟠
+- **Files:** `src/auth/cache.ts`, `src/auth/cache.test.ts`
+- **Spec & identifiers in scope:** none
+- **What to build:** a small cache keyed by token.
+- **How verified (end-to-end):** `npm test -- auth`
+- **Acceptance criteria:**
+  - [ ] a hit avoids the slow path
+  - [ ] a miss re-fetches
+```
+
+- The task id is the heading number, so `/tasks diff 1` targets it.
+- Read labels: `Files`, `Risk`, `Stories`, `TDD`, `Locks`, `Priority`, `Agent`,
+  `Model`, `Out of scope`, `Spec & identifiers in scope`, `What to build`,
+  `Acceptance criteria`. `How verified` is prose and does **not** become a gate;
+  add a `**Verify:**` line with a command to gate the task.
+- `sequentialDeps: true` turns file order into explicit dependencies.
+- `Risk: 🔴` (or any value in `approvalRisks`) holds the task for `/tasks approve`.
+- A task whose body matches `holdPattern` (default `[NEEDS DECISION`) is held and
+  the run pauses with the reason.
+- Field labels are configurable with `fields`; a custom parser can be plugged
+  with `parserModule`.
+
+Example: [`examples/tasks.headings.example.md`](examples/tasks.headings.example.md).
+
+## Running a PRD / `tasks.md` workflow
+
+If your tasks come from a PRD broken into a `tasks.md`, run in **assist** mode so
+the plugin implements and verifies but leaves the tree dirty for you to review
+and commit:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "opencode-sub-worker",
+      "options": {
+        "taskFormat": "headings",
+        "sequentialDeps": true,
+        "mode": "assist",
+        "detectCompletion": "checkboxes",
+        "flipCheckboxes": true,
+        "progressFile": "features/<feature>/progress.md",
+        "approvalRisks": ["🔴"],
+        "workerInstructionsFile": ".opencode/sub-worker-worker.md"
+      }
+    }
+  ]
+}
+```
+
+- `mode: "assist"` forces `autoMerge`, `commitBeforeMerge` and
+  `cleanupWorktrees` off.
+- `workerInstructionsFile` appends your project rules (no commits, tracker
+  discipline, and so on) to every worker prompt; `workerSkills` and
+  `workerInstructions` do the same inline.
+- `flipCheckboxes` writes `### N. [x]` back into the source list; `progressFile`
+  appends a per-task block. The orchestrator is the **only writer**, so parallel
+  workers never race on the file.
+- `detectCompletion: "checkboxes"` treats a flipped box as the done signal
+  instead of the worker's report.
 
 ## Command and tools
 
@@ -116,6 +190,9 @@ Plugin-level options (V2 object form):
     {
       "package": "opencode-sub-worker",
       "options": {
+        "taskFormat": "checklist",
+        "sequentialDeps": false,
+        "parserModule": "",
         "maxConcurrency": 3,
         "taskTimeoutMs": 1200000,
         "verifyTimeoutMs": 600000,
@@ -139,8 +216,18 @@ Plugin-level options (V2 object form):
         "coChangeLearning": false,
         "coChangeMinCount": 2,
         "mirrorSessionTitles": false,
+        "holdPattern": ["\\[NEEDS DECISION"],
+        "detectCompletion": "report",
+        "progressFile": "",
+        "flipCheckboxes": false,
+        "mode": "integrate",
+        "workerInstructions": "",
+        "workerInstructionsFile": "",
+        "workerSkills": [],
+        "workerContract": "generic",
         "verifierEnabled": false,
         "verifierAgent": "explore",
+        "verifierPrompt": "",
         "askUserOnBlocked": false,
         "maxCostUsd": 0,
         "maxTokens": 0,
@@ -155,6 +242,10 @@ Plugin-level options (V2 object form):
 |---|---|---|
 | `commandName` | `tasks` | Slash command name. |
 | `registerCommand` / `registerTools` | `true` | Toggle the command / tools. |
+| `taskFormat` | `checklist` | `checklist` or `headings` (PRD/`tasks.md` style). |
+| `fields` | (built-in) | Field-label mapping for the `headings` format. |
+| `sequentialDeps` | `false` | Treat file order as the dependency chain. |
+| `parserModule` | `""` | Path or package name of a custom parser module (`parse(source) => { tasks, errors }`). |
 | `maxConcurrency` | `3` | Max workers running at once. |
 | `taskTimeoutMs` | `1200000` | Per-task wall-clock timeout. |
 | `verifyTimeoutMs` | `600000` | Gate command timeout. |
@@ -162,6 +253,10 @@ Plugin-level options (V2 object form):
 | `freshWorktreeOnRetry` | `false` | Start a retry from a clean worktree instead of continuing in place. |
 | `continueOnError` | `false` | A failed/blocked task pauses the whole run; set `true` to let independent work continue. |
 | `repairOnFailure` | `true` | On a failed gate, steer the failure back to the same worker to repair it before counting an attempt. |
+| `workerInstructions` | `""` | Extra instructions appended to every worker prompt. |
+| `workerInstructionsFile` | `""` | A file whose contents are appended to every worker prompt. |
+| `workerSkills` | `[]` | Skills the worker should follow (appended to the prompt). |
+| `workerContract` | `generic` | Built-in worker report contract; `none` omits it. |
 | `workerAgent` | `subworker` | Worker agent id. |
 | `installWorkerAgent` | `true` | Write `.opencode/agents/<workerAgent>.md` on setup. |
 | `workerModel` | `""` | `provider/model[#variant]` for workers. Empty = inherit. |
@@ -178,8 +273,14 @@ Plugin-level options (V2 object form):
 | `coChangeLearning` | `false` | Learn file pairs that change together and treat them as conflicts. |
 | `coChangeMinCount` | `2` | Co-change count before a learned pair conflicts. |
 | `mirrorSessionTitles` | `false` | Mirror run status into the orchestrator session title. |
+| `holdPattern` | `["\\[NEEDS DECISION"]` | Regexes; a matching task is held and the run pauses. |
+| `detectCompletion` | `report` | `report` (worker report) or `checkboxes` (a flipped box in the source). |
+| `progressFile` | `""` | Append a per-task block here (relative to the project root). |
+| `flipCheckboxes` | `false` | Write `[x]` back to the source list when a task is done. |
+| `mode` | `integrate` | `integrate` (merge) or `assist` (leave the tree dirty; forces merge behaviours off). |
 | `verifierEnabled` | `false` | Run an independent read-only verifier session after the gate. |
 | `verifierAgent` | `explore` | Agent id used for the verifier. |
+| `verifierPrompt` | `""` | Extra verifier instructions appended to the verifier prompt. |
 | `askUserOnBlocked` | `false` | Keep a blocked worker alive and wait for `/tasks answer`. |
 | `maxCostUsd` | `0` | Pause the run when accumulated cost reaches this. `0` = off. |
 | `maxTokens` | `0` | Pause the run when accumulated tokens reach this. `0` = off. |
@@ -334,6 +435,16 @@ resumes blindly) and can be restarted with `/tasks resume`.
   OpenCode terminal provides, and is only active in the TUI.
 - **RPC status is per orchestrator session** and returns JSON; progress events
   are live only (disconnected subscribers miss them).
+- **In `assist` mode the plugin is the only writer of the source list and the
+  progress file.** It flips checkboxes and appends progress after each task, so
+  parallel workers never race on `tasks.md`; a worker that also writes the file
+  would race it.
+- **`headings` "How verified" is prose, not a gate.** Only an explicit
+  `**Verify:**` line gates the task; otherwise rely on the verifier and the
+  acceptance criteria.
+- **`detectCompletion: "checkboxes"` and `flipCheckboxes` are alternatives.** The
+  first trusts the worker to flip the box; the second has the plugin flip it (use
+  `report` detection then).
 - **Not a sandbox.** Workers inherit the session's permissions except for the
   write-scope rules the plugin adds.
 
