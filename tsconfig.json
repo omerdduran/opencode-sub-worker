@@ -12,6 +12,8 @@
     "forceConsistentCasingInFileNames": true,
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "@opentui/solid",
     "allowImportingTsExtensions": true,
     "rewriteRelativeImportExtensions": true,
     "noEmit": true

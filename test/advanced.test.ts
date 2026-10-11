@@ -2,7 +2,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { Engine } from "../src/core/engine.ts"
 import { normalizeOptions } from "../src/core/options.ts"
-import { setup as setupTui } from "../src/tui.ts"
+import { buildCommands, subscribeProgress, type CliContext, type RpcClient } from "../src/tui-commands.ts"
 import { FakeHost, until } from "./helpers.ts"
 
 test("a high-risk task waits for approval, then integrates on approve", async () => {
@@ -208,22 +208,27 @@ test("priority ordering starts the higher-priority task first", async () => {
   await until(() => run.status === "completed", 3000, "completed")
 })
 
-test("the bundled CLI plugin registers a status command and cleans up", () => {
-  const layers: Array<{ commands: Array<{ id: string }> }> = []
-  const context = {
-    client: {
-      rpc: () => ({ status: async () => ({ json: '{"status":"none"}' }), events: { on: () => () => {} } }),
-    },
-    ui: { toast: { show: () => {} }, router: { current: () => ({ type: "home" }) } },
-    attention: { notify: async () => ({}) },
-    keymap: {
-      layer: (factory: () => unknown) => {
-        layers.push(factory() as { commands: Array<{ id: string }> })
+test("the bundled CLI plugin exposes panel/status commands and subscribes to progress", () => {
+  const subscribed: string[] = []
+  const rpc: RpcClient = {
+    status: async () => ({ json: '{"status":"none"}' }),
+    events: {
+      on: (name: string) => {
+        subscribed.push(name)
+        return () => {}
       },
     },
   }
-  const cleanup = setupTui(context as never)
-  assert.equal(typeof cleanup, "function")
-  assert.ok(layers[0]!.commands.some((c) => c.id === "opencode-sub-worker.status"))
-  cleanup()
+  const context: CliContext = {
+    ui: { router: { current: () => ({ type: "session", sessionID: "s1" }) } },
+  }
+  const commands = buildCommands(context, rpc)
+  const ids = commands.map((c) => c.id)
+  assert.ok(ids.includes("opencode-sub-worker.panel"))
+  assert.ok(ids.includes("opencode-sub-worker.status"))
+
+  const unsubscribe = subscribeProgress(context, rpc)
+  assert.equal(typeof unsubscribe, "function")
+  assert.deepEqual(subscribed, ["progress"])
+  unsubscribe()
 })

@@ -261,10 +261,19 @@ The package exposes an RPC contract at `opencode-sub-worker/rpc` with a `status`
 method and `progress` events (emitted on every task/run transition), so other
 plugins and clients can observe a run over HTTP.
 
-It also exports a CLI plugin at `opencode-sub-worker/tui`: a "Task force status"
-palette / `/tasks` command that reads the run over RPC, plus attention
-notifications when a task or run finishes or fails. It renders nothing, so it
-needs no OpenTUI/solid dependency.
+It also exports a CLI plugin at `opencode-sub-worker/tui`:
+
+- a **run panel** in the `session.panel` slot — a live task table with per-task
+  status colors, counts, cost and tokens. Open it with `/tasks-panel` or the
+  "Sub-worker run panel" palette command; `[f]` toggles fullscreen and `[esc]`
+  closes it;
+- a **"Task force status"** palette / `/tasks` command that shows a compact
+  summary;
+- **attention notifications** when a task or run finishes or fails.
+
+The panel reads the run over RPC and refreshes on progress events plus a 2s poll.
+It renders with `@opentui/solid`; `@opentui/core`, `@opentui/solid` and
+`solid-js` are declared as optional peers (the terminal provides them).
 
 ```jsonc title="cli.json"
 { "plugins": ["opencode-sub-worker"] }
@@ -320,9 +329,9 @@ resumes blindly) and can be restarted with `/tasks resume`.
 - **`continueOnError` still marks dependents of a failed task as skipped.**
 - **`askUserOnBlocked` keeps a session alive** while the run is paused; it is
   disposed when the run is aborted or resumed.
-- **The bundled CLI plugin renders nothing.** It adds a status command and
-  attention notifications; a full OpenTUI/solid JSX panel is a follow-up that
-  would add those peer dependencies.
+- **The bundled CLI plugin renders a live panel** in the TUI; it requires the
+  optional `@opentui/core`, `@opentui/solid` and `solid-js` peers that the
+  OpenCode terminal provides, and is only active in the TUI.
 - **RPC status is per orchestrator session** and returns JSON; progress events
   are live only (disconnected subscribers miss them).
 - **Not a sandbox.** Workers inherit the session's permissions except for the
