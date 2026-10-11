@@ -1,0 +1,62 @@
+{
+  "name": "opencode-sub-worker",
+  "version": "0.1.0",
+  "description": "Turn a markdown task checklist into a dependency- and file-conflict-aware schedule, run ready tasks in parallel as isolated child sessions in their own git worktrees, coordinate through an orchestrator-mediated mailbox, and gate every task with a verification command.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "examples",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/*.test.ts",
+    "test:coverage": "node --test --experimental-test-coverage test/*.test.ts",
+    "check": "npm run typecheck && npm test",
+    "pack:check": "npm pack --dry-run",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "tasks",
+    "orchestration",
+    "worktree",
+    "subagent",
+    "parallel"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/omerdduran/opencode-sub-worker.git"
+  },
+  "homepage": "https://github.com/omerdduran/opencode-sub-worker#readme",
+  "bugs": {
+    "url": "https://github.com/omerdduran/opencode-sub-worker/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20",
+    "opencode": ">=2.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  }
+}

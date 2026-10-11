@@ -1,0 +1,14 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "opencode-sub-worker",
+      "options": {
+        "maxConcurrency": 3,
+        "maxAttempts": 2,
+        "useWorktrees": true,
+        "autoMerge": true
+      }
+    }
+  ]
+}

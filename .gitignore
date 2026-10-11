@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.log
+*.tgz
+.DS_Store
+
+# Plugin runtime state (owner-only snapshots and ledgers)
+.work/state.json
+.work/*.jsonl
+.opencode/agents/subworker.md
