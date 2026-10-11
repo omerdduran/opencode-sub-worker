@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/omerdduran/opencode-sub-worker/compare/v0.2.0...v0.3.0) (2026-10-11)
+
+
+### Features
+
+* live TUI run panel (JSX session.panel) over RPC ([1dd0812](https://github.com/omerdduran/opencode-sub-worker/commit/1dd0812b7cc240231d0aadf307899357910cce00))
+
 ## [0.2.0](https://github.com/omerdduran/opencode-sub-worker/compare/v0.1.2...v0.2.0) (2026-10-11)
 
 

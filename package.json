@@ -1,6 +1,6 @@
 {
   "name": "opencode-sub-worker",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Turn a markdown task checklist into a dependency- and file-conflict-aware schedule, run ready tasks in parallel as isolated child sessions in their own git worktrees, coordinate through an orchestrator-mediated mailbox, and gate every task with a verification command.",
   "type": "module",
   "main": "./dist/index.js",
@@ -71,9 +71,15 @@
     "solid-js": ">=1.9.0"
   },
   "peerDependenciesMeta": {
-    "@opentui/core": { "optional": true },
-    "@opentui/solid": { "optional": true },
-    "solid-js": { "optional": true }
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@opentui/core": "^0.6.0",
