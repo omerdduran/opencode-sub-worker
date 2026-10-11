@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/omerdduran/opencode-sub-worker/compare/v0.3.0...v0.4.0) (2026-10-11)
+
+
+### Features
+
+* task adapters, worker injection, assist mode and decision gates ([280fae5](https://github.com/omerdduran/opencode-sub-worker/commit/280fae5227226dc9484cd02185d52e43c4250f92))
+
 ## [0.3.0](https://github.com/omerdduran/opencode-sub-worker/compare/v0.2.0...v0.3.0) (2026-10-11)
 
 
