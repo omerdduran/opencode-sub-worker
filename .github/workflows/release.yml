@@ -3,6 +3,9 @@ name: Release
 on:
   push:
     branches: [main]
+  # Manual trigger: use it to publish the current package.json version with the
+  # trusted publisher (e.g. the very first release) without a local 2FA prompt.
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -23,15 +26,15 @@ jobs:
           config-file: .release-please-config.json
           manifest-file: .release-please-manifest.json
 
-  # Runs only when release-please cut a release. Publishes to npm via OIDC
-  # trusted publishing; provenance is generated automatically.
+  # Runs when release-please cut a release, or on a manual dispatch. Publishes
+  # to npm via OIDC trusted publishing; provenance is generated automatically.
   #
   # One-time setup on npmjs.com: add a Trusted Publisher for
   #   omerdduran / opencode-sub-worker / workflow: release.yml
   # and enable "Allow npm publish".
   publish:
     needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+    if: needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
