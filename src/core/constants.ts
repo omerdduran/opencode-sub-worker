@@ -32,6 +32,8 @@ export const META_KEYS = [
   "deps",
   "agent",
   "model",
+  "locks",
+  "priority",
   "risk",
   "timeout",
 ] as const

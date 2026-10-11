@@ -55,7 +55,7 @@ test("continueOnError lets independent tasks finish after one fails", async () =
   const host = new FakeHost()
   host.gateQueue = [{ ok: false, output: "boom", exitCode: 1, timedOut: false }]
   const engine = new Engine(
-    normalizeOptions({ maxConcurrency: 1, maxAttempts: 1, continueOnError: true }),
+    normalizeOptions({ maxConcurrency: 1, maxAttempts: 1, continueOnError: true, repairOnFailure: false }),
     host,
   )
   const source = "- [ ] a\n  - files: a.txt\n  - verify: npm test\n- [ ] b\n  - files: b.txt"
@@ -110,7 +110,7 @@ test("start refuses a dependency cycle", async () => {
 test("an independent verifier can reject a task", async () => {
   const host = new FakeHost()
   const engine = new Engine(
-    normalizeOptions({ maxConcurrency: 1, maxAttempts: 1, verifierEnabled: true, verifierAgent: "explore" }),
+    normalizeOptions({ maxConcurrency: 1, maxAttempts: 1, verifierEnabled: true, verifierAgent: "explore", repairOnFailure: false }),
     host,
   )
   const run = await engine.start("s1", "- [ ] a\n  - files: a.txt", "inline")

@@ -7,6 +7,7 @@ export type TaskStatus =
   | "pending"
   | "running"
   | "verifying"
+  | "review"
   | "done"
   | "failed"
   | "blocked"
@@ -29,19 +30,33 @@ export interface Task {
   checkedInSource: boolean
   /** Declared write set. Empty means "unknown" and therefore never parallel. */
   files: string[]
+  /** Named exclusive resources (beyond files), e.g. "db-migration". */
+  locks?: string[]
+  /** Higher runs first among ready tasks. Default 0. */
+  priority?: number
   /** Verification command. `null` means the task has no gate. */
   verify: string | null
   /** Resolved dependency ids. */
   deps: string[]
   agent?: string
   model?: string
+  /** Set on retry to try a fallback model instead of the declared one. */
+  modelOverride?: string
   risk?: string
   timeoutMs?: number
 
   status: TaskStatus
   attempts: number
+  /** In-place repair attempts after a failed gate. */
+  repairs?: number
   sessionID?: string
   worktree?: string
+  /** Branch checked out in the worktree, when known. */
+  branch?: string
+  /** True once the worktree's branch has been merged (or deliberately kept). */
+  integrated?: boolean
+  /** Captured gate output for `taskforce_logs`. */
+  gateOutput?: string
   /** Accumulated worker usage. */
   cost?: number
   tokens?: number
@@ -107,6 +122,15 @@ export interface RunState {
 export interface ParseResult {
   tasks: Task[]
   errors: string[]
+}
+
+/** A structured worker report parsed from the end of a worker's final message. */
+export interface WorkerReport {
+  status: "progress" | "blocked" | "done"
+  evidence?: string
+  blocker?: string
+  files?: string[]
+  note?: string
 }
 
 /** A single preview wave produced by the dry-run planner. */

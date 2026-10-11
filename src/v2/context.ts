@@ -87,6 +87,19 @@ export interface V2Context {
     list(input: Record<string, unknown>): Promise<unknown>
     refresh?(input: Record<string, unknown>): Promise<unknown>
   }
+
+  readonly rpc?: {
+    (definition: unknown): {
+      events: { on(name: string, cb: (event: { data: Record<string, unknown> }) => void): () => void }
+    }
+    register(
+      definition: unknown,
+      handlers: Record<string, (input: unknown, context: unknown) => Promise<unknown>>,
+    ): Promise<{
+      events: { emit(name: string, data: Record<string, unknown>): Promise<void> }
+      dispose(): Promise<void>
+    }>
+  }
 }
 
 export interface V2ToolContext {

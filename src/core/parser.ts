@@ -136,6 +136,14 @@ export function parseChecklist(source: string): ParseResult {
     if (r.meta["agent"]) task.agent = r.meta["agent"]!
     if (r.meta["model"]) task.model = r.meta["model"]!
     if (r.meta["risk"]) task.risk = r.meta["risk"]!
+    if (r.meta["locks"]) {
+      const locks = splitList(r.meta["locks"]!).map((s) => s.trim())
+      if (locks.length > 0) task.locks = locks
+    }
+    if (r.meta["priority"]) {
+      const p = Number(r.meta["priority"])
+      if (Number.isFinite(p)) task.priority = p
+    }
     if (timeoutMs !== undefined) task.timeoutMs = timeoutMs
     return task
   })

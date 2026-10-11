@@ -1,14 +1,15 @@
 /**
- * V2 plugin entrypoint. Registers the command and the agent tools on an
- * OpenCode V2 plugin context and returns a cleanup function.
+ * V2 plugin entrypoint. Registers the command, the agent tools and the RPC
+ * surface on an OpenCode V2 plugin context and returns a cleanup function.
  *
  * A plugin cannot register new agents through `agent.transform` (there is no
  * `add`), so the worker agent is installed as a markdown file on setup.
  */
 
-import { Engine } from "../core/engine.ts"
+import { Engine, type EngineEvent } from "../core/engine.ts"
 import { normalizeOptions } from "../core/options.ts"
 import { control } from "../core/prompt.ts"
+import { SubWorker } from "../rpc.ts"
 import type { V2Context, V2ToolContext } from "./context.ts"
 import { createV2Port, readSource } from "./port.ts"
 import { registerV2Tools, type V2ToolEditor } from "./tools.ts"
@@ -24,20 +25,24 @@ function isRegistration(value: unknown): value is Registration {
 function helpText(): string {
   return [
     "Usage:",
-    "  /tasks plan <file|markdown>   preview the dependency/conflict schedule (no execution)",
-    "  /tasks run <file|markdown>    start the run (parallel isolated workers)",
-    "  /tasks status                 show task statuses and recent activity",
-    "  /tasks list                   one-line summary",
-    "  /tasks resume                 resume a paused run",
-    "  /tasks abort                  stop the run and its workers",
-    "  /tasks answer <taskID> <text> answer a blocked worker and continue it",
+    "  /tasks plan <file|markdown>        preview the dependency/conflict schedule",
+    "  /tasks run <file|markdown>         start the run (parallel isolated workers)",
+    "  /tasks add <file|markdown>         add tasks to the active run",
+    "  /tasks status                      show task statuses and recent activity",
+    "  /tasks list                        one-line summary",
+    "  /tasks diff <taskID>               show a task's worktree diff",
+    "  /tasks logs <taskID>               show a task's status, gate output and history",
+    "  /tasks approve <taskID>            approve a task held at the approval gate",
+    "  /tasks reject <taskID> <reason>    reject a task held at the approval gate",
+    "  /tasks answer <taskID> <text>      answer a blocked worker and continue it",
+    "  /tasks broadcast <text>            message every running worker",
+    "  /tasks resume | abort              resume a paused run / stop the run",
   ].join("\n")
 }
 
 async function resolveSource(baseDirectory: string, rest: string): Promise<{ text: string; label: string }> {
   const trimmed = rest.trim()
   if (trimmed.length === 0) throw new Error("provide a file path or inline markdown")
-  // Inline markdown (a checklist line, heading, or fence) is used as-is.
   if (/[\n#`]/.test(trimmed) || /^[-*]\s*\[/.test(trimmed)) {
     return { text: trimmed, label: "inline" }
   }
@@ -77,6 +82,11 @@ async function handleCommand(
         `Run started: ${run.tasks.length} task(s), maxConcurrency=${run.maxConcurrency}. Each ready task runs as an isolated worker session in its own worktree; use /tasks status to follow it.`,
       )
     }
+    case "add": {
+      const src = await resolveSource(baseDirectory, rest)
+      const run = await engine.add(sessionID, src.text, src.label)
+      return control(run ? `Added tasks (now ${run.tasks.length}).` : "No active run to add to.")
+    }
     case "resume": {
       const run = await engine.resume(sessionID)
       return control(run ? `Run resumed (${run.tasks.length} task(s)).` : "No run to resume.")
@@ -86,11 +96,35 @@ async function handleCommand(
       const run = await engine.abort(sessionID)
       return control(run ? "Run aborted." : "No run to abort.")
     }
+    case "diff": {
+      if (!rest) return control("Usage: /tasks diff <taskID>")
+      return control(await engine.diffText(sessionID, rest))
+    }
+    case "logs": {
+      if (!rest) return control("Usage: /tasks logs <taskID>")
+      return control(engine.logsText(sessionID, rest))
+    }
+    case "approve": {
+      if (!rest) return control("Usage: /tasks approve <taskID>")
+      const ok = await engine.approve(sessionID, rest)
+      return control(ok ? `Approved ${rest}; integrating.` : `No task ${rest} awaiting approval.`)
+    }
+    case "reject": {
+      const m = /^(\S+)\s*([\s\S]*)$/.exec(rest)
+      if (!m) return control("Usage: /tasks reject <taskID> <reason>")
+      const ok = await engine.reject(sessionID, m[1]!, m[2]!.trim() || "rejected")
+      return control(ok ? `Rejected ${m[1]}.` : `No task ${m[1]} awaiting approval.`)
+    }
     case "answer": {
       const m = /^(\S+)\s+([\s\S]+)$/.exec(rest)
       if (!m) return control("Usage: /tasks answer <taskID> <text>")
       const ok = await engine.answer(sessionID, m[1]!, m[2]!.trim())
       return control(ok ? `Answer sent to ${m[1]}.` : `No blocked worker ${m[1]} to answer.`)
+    }
+    case "broadcast": {
+      if (!rest) return control("Usage: /tasks broadcast <text>")
+      const count = await engine.broadcast(sessionID, rest)
+      return control(`Broadcast reached ${count} worker(s).`)
     }
     default:
       return control(helpText())
@@ -99,14 +133,17 @@ async function handleCommand(
 
 export async function setupV2(rawCtx: unknown): Promise<() => Promise<void>> {
   const ctx = rawCtx as V2Context
-  // Only a real V2 host (with a version string) should activate.
   if (!ctx.app || typeof ctx.app.version !== "string" || ctx.app.version.length === 0) {
     return async () => {}
   }
 
   const options = normalizeOptions(ctx.options ?? {})
   const port = createV2Port(ctx)
-  const engine = new Engine(options, port)
+
+  // The engine emits events before the RPC registration exists; route them
+  // through a mutable sink that the registration fills in below.
+  let sink: ((event: EngineEvent) => void) | undefined
+  const engine = new Engine(options, port, (event) => sink?.(event))
 
   await engine.load()
   await port.log("info", "opencode-sub-worker ready (V2)", { version: ctx.app.version })
@@ -124,12 +161,38 @@ export async function setupV2(rawCtx: unknown): Promise<() => Promise<void>> {
     if (isRegistration(registration)) disposers.push(registration)
   }
 
+  // RPC: status method + progress events for external clients / the CLI plugin.
+  if (ctx.rpc) {
+    try {
+      const registration = await ctx.rpc.register(SubWorker, {
+        status: async (input: unknown) => {
+          const { sessionID } = input as { sessionID: string }
+          const snapshot = engine.snapshot(sessionID)
+          return { json: JSON.stringify(snapshot ?? { status: "none" }) }
+        },
+      })
+      track(registration)
+      sink = (event) => {
+        void registration.events
+          .emit("progress", {
+            type: event.type,
+            ...(event.runID !== undefined ? { runID: event.runID } : {}),
+            ...(event.taskID !== undefined ? { taskID: event.taskID } : {}),
+            ...(event.detail !== undefined ? { detail: event.detail } : {}),
+          })
+          .catch(() => {})
+      }
+    } catch (err) {
+      await port.log("warn", "could not register RPC", { error: String(err) })
+    }
+  }
+
   if (options.registerCommand) {
     track(
       await ctx.command.transform((editor) => {
         editor.add({
           name: options.commandName,
-          description: "Plan or run a markdown task checklist across isolated parallel workers.",
+          description: "Plan, run, inspect and control a markdown task checklist across isolated workers.",
           execute: async (invocation: unknown) => {
             const inv = invocation as {
               sessionID: string

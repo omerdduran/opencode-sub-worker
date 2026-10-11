@@ -10,6 +10,7 @@ export type {
   MailboxMessage,
   RunHistoryEntry,
   ParseResult,
+  WorkerReport,
   Wave,
   Graph,
   SchedulePreview,
@@ -46,6 +47,15 @@ export {
 } from "./scheduler.ts"
 export { RunStore, makeRun } from "./state.ts"
 export type { StoreSnapshot } from "./state.ts"
-export { buildWorkerPrompt, buildVerifierPrompt, parseWorkerOutcome, control, summarize } from "./prompt.ts"
+export { CoChangeStore } from "./cochange.ts"
+export {
+  buildWorkerPrompt,
+  buildVerifierPrompt,
+  buildRepairPrompt,
+  parseWorkerOutcome,
+  parseWorkerReport,
+  control,
+  summarize,
+} from "./prompt.ts"
 export { Engine, parseModel, parseModelRef } from "./engine.ts"
-export type { ReportInput } from "./engine.ts"
+export type { ReportInput, EngineEvent } from "./engine.ts"

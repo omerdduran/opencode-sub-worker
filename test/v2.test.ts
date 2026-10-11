@@ -75,7 +75,23 @@ test("setup registers the command and the tools", async () => {
   assert.equal(fake.commandDef!.name, "tasks")
 
   const names = fake.tools.map((t) => t.name)
-  for (const expected of ["taskforce_plan", "taskforce_run", "taskforce_status", "taskforce_resume", "taskforce_abort", "taskforce_answer", "taskforce_send", "worker_report", "worker_inbox"]) {
+  for (const expected of [
+    "taskforce_plan",
+    "taskforce_run",
+    "taskforce_status",
+    "taskforce_resume",
+    "taskforce_abort",
+    "taskforce_answer",
+    "taskforce_send",
+    "taskforce_diff",
+    "taskforce_logs",
+    "taskforce_approve",
+    "taskforce_reject",
+    "taskforce_add",
+    "taskforce_broadcast",
+    "worker_report",
+    "worker_inbox",
+  ]) {
     assert.ok(names.includes(expected), `missing tool ${expected}`)
   }
   await cleanup()
@@ -119,4 +135,18 @@ test("/tasks run starts a run and reports it in the submitted prompt", async () 
   await fake.commandDef!.execute({ sessionID: "s1", prompt: { text: `run ${source}` } })
   assert.ok(fake.prompts.length >= 1)
   assert.ok(fake.prompts.some((p) => /Run started/.test(String(p["text"]))))
+})
+
+test("setup registers the RPC surface when the host exposes it", async () => {
+  const fake = makeV2Context()
+  let registered: unknown
+  ;(fake.ctx as Record<string, unknown>)["rpc"] = {
+    register: async (definition: unknown) => {
+      registered = definition
+      return { events: { emit: async () => {} }, dispose: async () => {} }
+    },
+  }
+  await setupV2(fake.ctx)
+  assert.ok(registered)
+  assert.equal((registered as { id: string }).id, "opencode.sub-worker")
 })

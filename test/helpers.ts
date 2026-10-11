@@ -35,6 +35,9 @@ export class FakeHost implements HostPort {
   stats: { cost: number; tokens: number } = { cost: 0, tokens: 0 }
   /** Files returned by changedFiles (for the diff-scope check). */
   changed: string[] = []
+  /** Diff returned by worktreeDiff. */
+  diff = "diff --git a/x b/x"
+  readonly titles: Array<{ sessionID: string; title: string }> = []
   failWorktree = false
   commitOk = true
 
@@ -59,7 +62,7 @@ export class FakeHost implements HostPort {
     if (this.failWorktree) throw new Error("not a git repository")
     const directory = `${this.baseDirectory}/../wt-${name}`
     this.worktrees.push(directory)
-    return { directory }
+    return { directory, branch: `branch-${name}` }
   }
 
   async removeWorktree(directory: string): Promise<void> {
@@ -95,6 +98,14 @@ export class FakeHost implements HostPort {
 
   async changedFiles(): Promise<string[]> {
     return [...this.changed]
+  }
+
+  async worktreeDiff(): Promise<string> {
+    return this.diff
+  }
+
+  async setSessionTitle(sessionID: string, title: string): Promise<void> {
+    this.titles.push({ sessionID, title })
   }
 
   async commitWorktree(directory: string, message: string): Promise<MergeResult> {

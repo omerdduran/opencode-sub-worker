@@ -1,9 +1,11 @@
 /**
  * Runtime scheduler: given the current task states, choose which pending tasks
  * may start now. Pure and deterministic so it can be unit tested without a host.
+ *
+ * Among ready tasks, higher `priority` wins, then source order.
  */
 
-import { conflicts } from "./graph.ts"
+import { conflicts, type ConflictPredicate } from "./graph.ts"
 import type { Task } from "./types.ts"
 
 export function isSettled(status: Task["status"]): boolean {
@@ -15,20 +17,22 @@ export function isTerminalBad(status: Task["status"]): boolean {
 }
 
 /** Ids of tasks that may start, bounded by free concurrency slots and conflicts. */
-export function nextBatch(tasks: Task[], maxConcurrency: number): string[] {
-  const running = tasks.filter((t) => t.status === "running" || t.status === "verifying")
+export function nextBatch(tasks: Task[], maxConcurrency: number, extra?: ConflictPredicate): string[] {
+  const running = tasks.filter(
+    (t) => t.status === "running" || t.status === "verifying" || t.status === "review",
+  )
   const free = maxConcurrency - running.length
   if (free <= 0) return []
 
   const done = new Set(tasks.filter((t) => isSettled(t.status)).map((t) => t.id))
+  const candidates = tasks.filter((t) => t.status === "pending" && t.deps.every((d) => done.has(d)))
+  candidates.sort((x, y) => (y.priority ?? 0) - (x.priority ?? 0) || x.index - y.index)
+
   const busy: Task[] = [...running]
   const chosen: Task[] = []
-
-  for (const t of tasks) {
+  for (const t of candidates) {
     if (chosen.length >= free) break
-    if (t.status !== "pending") continue
-    if (!t.deps.every((d) => done.has(d))) continue
-    if (busy.some((b) => conflicts(b, t))) continue
+    if (busy.some((b) => conflicts(b, t, extra))) continue
     chosen.push(t)
     busy.push(t)
   }
@@ -63,7 +67,7 @@ export function propagateSkips(tasks: Task[]): string[] {
 }
 
 export function activeCount(tasks: Task[]): number {
-  return tasks.filter((t) => t.status === "running" || t.status === "verifying").length
+  return tasks.filter((t) => t.status === "running" || t.status === "verifying" || t.status === "review").length
 }
 
 export function hasPending(tasks: Task[]): boolean {

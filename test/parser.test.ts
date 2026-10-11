@@ -62,3 +62,9 @@ test("asterisk bullets and nested checkboxes are both recognised", () => {
   assert.equal(tasks.length, 2)
   assert.deepEqual(tasks[1]!.files, ["n.txt"])
 })
+
+test("parses named locks and priority", () => {
+  const { tasks } = parseChecklist("- [ ] a\n  - locks: db, staging\n  - priority: 5")
+  assert.deepEqual(tasks[0]!.locks, ["db", "staging"])
+  assert.equal(tasks[0]!.priority, 5)
+})

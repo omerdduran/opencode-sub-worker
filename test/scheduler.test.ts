@@ -55,3 +55,17 @@ test("propagateSkips skips tasks whose dependency failed", () => {
   assert.equal(tasks[1]!.status, "skipped")
   assert.equal(tasks[2]!.status, "skipped")
 })
+
+test("nextBatch orders candidates by priority, then source order", () => {
+  const tasks = [
+    task({ id: "a", files: ["a"], index: 1 }),
+    { ...task({ id: "b", files: ["b"], index: 2 }), priority: 10 },
+    task({ id: "c", files: ["c"], index: 3 }),
+  ]
+  assert.deepEqual(nextBatch(tasks, 1), ["b"])
+})
+
+test("nextBatch honours an extra conflict predicate", () => {
+  const tasks = [task({ id: "a", files: ["a"] }), task({ id: "b", files: ["b"] })]
+  assert.deepEqual(nextBatch(tasks, 3, () => true), ["a"])
+})

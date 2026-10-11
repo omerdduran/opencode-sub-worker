@@ -22,6 +22,8 @@ export interface PluginOptions {
   freshWorktreeOnRetry: boolean
   /** A failed/blocked task no longer pauses the whole run; independent work continues. */
   continueOnError: boolean
+  /** On a failed gate, steer the failure back to the same worker to repair it. */
+  repairOnFailure: boolean
 
   /** Worker agent id (installed by the plugin when installWorkerAgent is on). */
   workerAgent: string
@@ -31,6 +33,8 @@ export interface PluginOptions {
   workerModel: string
   /** Per-agent model overrides, keyed by the task's `agent:` value. */
   roleModels: Record<string, string>
+  /** Ordered fallback model references tried on retry after a failure. */
+  fallbackModels: string[]
 
   /** Create a git worktree per worker. When false, workers share the project. */
   useWorktrees: boolean
@@ -47,6 +51,15 @@ export interface PluginOptions {
   enforceWriteScope: boolean
   /** After a worker finishes, fail the task if it touched undeclared files. */
   enforceDiffScope: boolean
+
+  /** Risk labels (case-insensitive) that require approval before integration. */
+  approvalRisks: string[]
+  /** Learn git co-change pairs and treat them as conflicts. */
+  coChangeLearning: boolean
+  /** Minimum co-change count before a learned pair conflicts. */
+  coChangeMinCount: number
+  /** Mirror run/task status into the orchestrator session title. */
+  mirrorSessionTitles: boolean
 
   /** Run an independent read-only verifier session after the gate passes. */
   verifierEnabled: boolean
@@ -76,11 +89,13 @@ export const DEFAULT_OPTIONS: PluginOptions = {
   maxAttempts: 2,
   freshWorktreeOnRetry: false,
   continueOnError: false,
+  repairOnFailure: true,
 
   workerAgent: DEFAULT_WORKER_AGENT,
   installWorkerAgent: true,
   workerModel: "",
   roleModels: {},
+  fallbackModels: [],
 
   useWorktrees: true,
   requireWorktrees: true,
@@ -90,6 +105,11 @@ export const DEFAULT_OPTIONS: PluginOptions = {
 
   enforceWriteScope: true,
   enforceDiffScope: true,
+
+  approvalRisks: [],
+  coChangeLearning: false,
+  coChangeMinCount: 2,
+  mirrorSessionTitles: false,
 
   verifierEnabled: false,
   verifierAgent: "explore",
@@ -127,6 +147,11 @@ function roleModels(raw: unknown): Record<string, string> {
   return out
 }
 
+function strArray(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return []
+  return raw.filter((x): x is string => typeof x === "string" && x.trim().length > 0).map((x) => x.trim())
+}
+
 export function normalizeOptions(raw: unknown): PluginOptions {
   const o = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>
   return {
@@ -140,11 +165,13 @@ export function normalizeOptions(raw: unknown): PluginOptions {
     maxAttempts: num(o["maxAttempts"], DEFAULT_OPTIONS.maxAttempts, { min: 1, integer: true }),
     freshWorktreeOnRetry: bool(o["freshWorktreeOnRetry"], DEFAULT_OPTIONS.freshWorktreeOnRetry),
     continueOnError: bool(o["continueOnError"], DEFAULT_OPTIONS.continueOnError),
+    repairOnFailure: bool(o["repairOnFailure"], DEFAULT_OPTIONS.repairOnFailure),
 
     workerAgent: str(o["workerAgent"], DEFAULT_OPTIONS.workerAgent),
     installWorkerAgent: bool(o["installWorkerAgent"], DEFAULT_OPTIONS.installWorkerAgent),
     workerModel: typeof o["workerModel"] === "string" ? o["workerModel"].trim() : DEFAULT_OPTIONS.workerModel,
     roleModels: roleModels(o["roleModels"]),
+    fallbackModels: strArray(o["fallbackModels"]),
 
     useWorktrees: bool(o["useWorktrees"], DEFAULT_OPTIONS.useWorktrees),
     requireWorktrees: bool(o["requireWorktrees"], DEFAULT_OPTIONS.requireWorktrees),
@@ -154,6 +181,11 @@ export function normalizeOptions(raw: unknown): PluginOptions {
 
     enforceWriteScope: bool(o["enforceWriteScope"], DEFAULT_OPTIONS.enforceWriteScope),
     enforceDiffScope: bool(o["enforceDiffScope"], DEFAULT_OPTIONS.enforceDiffScope),
+
+    approvalRisks: strArray(o["approvalRisks"]),
+    coChangeLearning: bool(o["coChangeLearning"], DEFAULT_OPTIONS.coChangeLearning),
+    coChangeMinCount: num(o["coChangeMinCount"], DEFAULT_OPTIONS.coChangeMinCount, { min: 1, integer: true }),
+    mirrorSessionTitles: bool(o["mirrorSessionTitles"], DEFAULT_OPTIONS.mirrorSessionTitles),
 
     verifierEnabled: bool(o["verifierEnabled"], DEFAULT_OPTIONS.verifierEnabled),
     verifierAgent: str(o["verifierAgent"], DEFAULT_OPTIONS.verifierAgent),

@@ -164,7 +164,11 @@ export function createV2Port(ctx: V2Context): HostPort {
       const created = await worktree.create({ projectID, name })
       const directory = typeof created["directory"] === "string" ? (created["directory"] as string) : ""
       if (directory.length === 0) throw new Error("worktree create returned no directory")
-      return { directory }
+      let branch: string | undefined
+      const res = await runCommand(`git -C ${shq(directory)} rev-parse --abbrev-ref HEAD`, directory, 30_000)
+      const b = res.output.trim().split("\n").pop()?.trim() ?? ""
+      if (res.code === 0 && b.length > 0 && b !== "HEAD") branch = b
+      return branch !== undefined ? { directory, branch } : { directory }
     },
 
     async removeWorktree(directory: string, force: boolean): Promise<void> {
@@ -279,6 +283,28 @@ export function createV2Port(ctx: V2Context): HostPort {
       )
       const nothing = /nothing to commit|no changes added|nothing added to commit/i.test(res.output)
       return { ok: res.code === 0 || nothing, output: res.output }
+    },
+
+    async worktreeDiff(directory: string): Promise<string> {
+      const diff = await runCommand(`git -C ${shq(directory)} diff HEAD`, directory, 60_000)
+      const status = await runCommand(`git -C ${shq(directory)} status --porcelain`, directory, 30_000)
+      const untracked = status.output
+        .split("\n")
+        .filter((line) => line.startsWith("?? "))
+        .map((line) => line.slice(3).trim())
+        .filter((p) => p.length > 0)
+      const parts: string[] = []
+      if (diff.output.length > 0) parts.push(diff.output)
+      if (untracked.length > 0) parts.push(`Untracked files:\n${untracked.map((f) => `  ${f}`).join("\n")}`)
+      return parts.length > 0 ? parts.join("\n\n") : "(no changes)"
+    },
+
+    async setSessionTitle(sessionID: string, title: string): Promise<void> {
+      try {
+        await ctx.session.update({ sessionID, title })
+      } catch {
+        // cosmetic only
+      }
     },
 
     async sendWorkerMessage(sessionID: string, text: string): Promise<void> {

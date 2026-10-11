@@ -135,6 +135,80 @@ export function registerV2Tools(editor: V2ToolEditor, engine: Engine): void {
   })
 
   editor.add({
+    name: "taskforce_diff",
+    description: "Show the unified diff of a task's isolated worktree (or its changed files if it ran in place).",
+    input: { type: "object", properties: { taskID: { type: "string" } }, required: ["taskID"], additionalProperties: false },
+    execute: async (input: unknown, context: V2ToolContext) => {
+      const args = input as { taskID: string }
+      return { content: envelope(true, { diff: await engine.diffText(context.sessionID, args.taskID) }) }
+    },
+  })
+
+  editor.add({
+    name: "taskforce_logs",
+    description: "Show a task's status, branch, gate output, evidence, and history.",
+    input: { type: "object", properties: { taskID: { type: "string" } }, required: ["taskID"], additionalProperties: false },
+    execute: async (input: unknown, context: V2ToolContext) => {
+      const args = input as { taskID: string }
+      return { content: envelope(true, { logs: engine.logsText(context.sessionID, args.taskID) }) }
+    },
+  })
+
+  editor.add({
+    name: "taskforce_approve",
+    description: "Approve a task held at the approval gate and integrate it.",
+    input: { type: "object", properties: { taskID: { type: "string" } }, required: ["taskID"], additionalProperties: false },
+    execute: async (input: unknown, context: V2ToolContext) => {
+      const args = input as { taskID: string }
+      const ok = await engine.approve(context.sessionID, args.taskID)
+      return { content: envelope(ok, ok ? { approved: true } : { error: "no_task_awaiting_approval" }) }
+    },
+  })
+
+  editor.add({
+    name: "taskforce_reject",
+    description: "Reject a task held at the approval gate.",
+    input: {
+      type: "object",
+      properties: { taskID: { type: "string" }, reason: { type: "string" } },
+      required: ["taskID"],
+      additionalProperties: false,
+    },
+    execute: async (input: unknown, context: V2ToolContext) => {
+      const args = input as { taskID: string; reason?: string }
+      const ok = await engine.reject(context.sessionID, args.taskID, args.reason ?? "rejected")
+      return { content: envelope(ok, ok ? { rejected: true } : { error: "no_task_awaiting_approval" }) }
+    },
+  })
+
+  editor.add({
+    name: "taskforce_add",
+    description: "Add tasks to the active run from another checklist. Provide `file` or `source`.",
+    input: SOURCE_SCHEMA,
+    execute: async (input: unknown, context: V2ToolContext) => {
+      try {
+        const { text, label } = await readSource(engine.baseDirectory, input as { source?: string; file?: string })
+        const run = await engine.add(context.sessionID, text, label)
+        if (!run) return { content: envelope(false, { error: "no_run" }) }
+        return { content: envelope(true, { taskCount: run.tasks.length }) }
+      } catch (err) {
+        return { content: envelope(false, { error: String(err) }) }
+      }
+    },
+  })
+
+  editor.add({
+    name: "taskforce_broadcast",
+    description: "Send a message to every running worker in the active run.",
+    input: { type: "object", properties: { text: { type: "string" } }, required: ["text"], additionalProperties: false },
+    execute: async (input: unknown, context: V2ToolContext) => {
+      const args = input as { text: string }
+      const count = await engine.broadcast(context.sessionID, args.text)
+      return { content: envelope(true, { reached: count }) }
+    },
+  })
+
+  editor.add({
     name: "worker_report",
     description:
       "Worker tool: report progress, completion, or a blocker to the orchestrator's mailbox. Call this from a worker session.",

@@ -80,7 +80,7 @@ test("a verification gate runs in the worktree and a passing gate completes the 
 test("a failing gate pauses the run when retries are exhausted", async () => {
   const host = new FakeHost()
   host.gateQueue = [{ ok: false, output: "boom", exitCode: 1, timedOut: false }]
-  const engine = new Engine(normalizeOptions({ maxConcurrency: 1, maxAttempts: 1 }), host)
+  const engine = new Engine(normalizeOptions({ maxConcurrency: 1, maxAttempts: 1, repairOnFailure: false }), host)
   const source = "- [ ] a\n  - files: a.txt\n  - verify: npm test"
   const run = await engine.start("s1", source, "inline")
   await until(() => host.sessionForTask("t1") !== undefined, 3000, "worker")
@@ -90,7 +90,7 @@ test("a failing gate pauses the run when retries are exhausted", async () => {
   assert.ok(host.notes.some((n) => n.includes("failed")))
 })
 
-test("a failing gate retries once, then completes when the gate passes", async () => {
+test("a failing gate steers the same worker to repair before failing", async () => {
   const host = new FakeHost()
   host.gateQueue = [
     { ok: false, output: "first failure", exitCode: 1, timedOut: false },
@@ -101,12 +101,16 @@ test("a failing gate retries once, then completes when the gate passes", async (
   const run = await engine.start("s1", source, "inline")
 
   await until(() => host.sessionForTask("t1") !== undefined, 3000, "first worker")
+  const session = host.sessionForTask("t1")!
   host.finishTask("t1", "[task:done] first try")
   await until(() => host.gateCalls.length === 1, 3000, "first gate")
-  await until(() => host.sessionForTask("t1") !== undefined, 3000, "retry worker")
+  await until(() => host.steers.length === 1, 3000, "repair steer")
+  assert.equal(host.sessionForTask("t1"), session, "the same session is reused")
   host.finishTask("t1", "[task:done] second try")
   await until(() => run.status === "completed", 3000, "completed")
-  assert.equal(run.tasks[0]!.attempts, 1)
+  assert.equal(run.tasks[0]!.repairs, 1)
+  assert.equal(run.tasks[0]!.attempts, 0)
+  assert.match(host.steers[0]!.text, /repair t1/)
 })
 
 test("a worker that reports blocked pauses the run", async () => {
@@ -181,7 +185,7 @@ test("a recovered run loads paused and resume restarts it", async () => {
 test("resume un-skips tasks that were skipped only because a dependency failed", async () => {
   const host = new FakeHost()
   host.gateQueue = [{ ok: false, output: "boom", exitCode: 1, timedOut: false }]
-  const engine = new Engine(normalizeOptions({ maxConcurrency: 1, maxAttempts: 1 }), host)
+  const engine = new Engine(normalizeOptions({ maxConcurrency: 1, maxAttempts: 1, repairOnFailure: false }), host)
   const source =
     "- [ ] a\n  - files: a.txt\n  - verify: npm test\n- [ ] b\n  - files: b.txt\n  - deps: 1"
   const run = await engine.start("s1", source, "inline")

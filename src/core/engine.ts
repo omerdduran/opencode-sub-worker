@@ -3,17 +3,26 @@
  *
  * Deterministic, host-independent scheduling: it parses a checklist, builds a
  * dependency/conflict graph, launches isolated worker sessions for ready tasks,
- * waits for them, enforces the declared write scope, gates each result with a
- * verification command (optionally an independent verifier session), merges the
- * worker's branch, and advances. All host interaction goes through `HostPort`.
+ * waits for them, enforces the declared write scope, gates each result (with an
+ * in-place repair loop and an optional independent verifier), optionally holds
+ * risky tasks for approval, merges the worker's branch, and advances. All host
+ * interaction goes through `HostPort`.
  */
 
 import { parseChecklist } from "./parser.ts"
-import { findCycle, previewWaves } from "./graph.ts"
+import { findCycle, previewWaves, type ConflictPredicate } from "./graph.ts"
 import { activeCount, hasPending, nextBatch, propagateSkips } from "./scheduler.ts"
-import { buildVerifierPrompt, buildWorkerPrompt, control, parseWorkerOutcome, summarize } from "./prompt.ts"
+import {
+  buildRepairPrompt,
+  buildVerifierPrompt,
+  buildWorkerPrompt,
+  control,
+  parseWorkerReport,
+  summarize,
+} from "./prompt.ts"
 import { makeRun, RunStore } from "./state.ts"
 import { matchesAny } from "./glob.ts"
+import { CoChangeStore } from "./cochange.ts"
 import { resolveModelRef, type PluginOptions } from "./options.ts"
 import type { MailboxMessage, RunState, Task } from "./types.ts"
 import { CONTROL_MARKER } from "./constants.ts"
@@ -25,6 +34,13 @@ export interface ReportInput {
   evidence?: string
 }
 
+export interface EngineEvent {
+  type: string
+  runID?: string
+  taskID?: string
+  detail?: string
+}
+
 interface WaitOutcome {
   taskID: string
   timedOut: boolean
@@ -32,15 +48,19 @@ interface WaitOutcome {
 
 export class Engine {
   readonly store = new RunStore()
+  readonly cochange: CoChangeStore
   private readonly options: PluginOptions
   private readonly port: HostPort
+  private readonly onEvent?: (event: EngineEvent) => void
   private readonly activeLoops = new Set<string>()
   /** In-flight completion waiters, keyed by `${runId}:${taskId}`. */
   private readonly waits = new Map<string, Promise<WaitOutcome>>()
 
-  constructor(options: PluginOptions, port: HostPort) {
+  constructor(options: PluginOptions, port: HostPort, onEvent?: (event: EngineEvent) => void) {
     this.options = options
     this.port = port
+    this.onEvent = onEvent
+    this.cochange = new CoChangeStore(options.coChangeMinCount)
   }
 
   private now(): number {
@@ -63,19 +83,41 @@ export class Engine {
     return `${run.id}:${task.id}`
   }
 
+  private emit(event: EngineEvent): void {
+    try {
+      this.onEvent?.(event)
+    } catch {
+      // observers must never break the loop
+    }
+  }
+
+  private conflictExtra(): ConflictPredicate | undefined {
+    if (!this.options.coChangeLearning) return undefined
+    return (a, b) => this.cochange.conflicts(a.files, b.files)
+  }
+
+  private approvalRequired(task: Task): boolean {
+    if (this.options.approvalRisks.length === 0) return false
+    if (!task.risk) return false
+    const risk = task.risk.toLowerCase()
+    return this.options.approvalRisks.some((r) => r.toLowerCase() === risk)
+  }
+
   // ---- planning ---------------------------------------------------------
 
   planText(source: string, label: string): string {
     const { tasks, errors } = parseChecklist(source)
-    const preview = previewWaves(tasks)
+    const preview = previewWaves(tasks, this.conflictExtra())
     const lines: string[] = [`Tasks (${tasks.length}) from ${label}:`]
     for (const t of tasks) {
       const bits: string[] = []
       if (t.files.length > 0) bits.push(`files: ${t.files.join(", ")}`)
+      if (t.locks && t.locks.length > 0) bits.push(`locks: ${t.locks.join(", ")}`)
       if (t.verify) bits.push(`verify: ${t.verify}`)
       if (t.deps.length > 0) bits.push(`deps: ${t.deps.join(", ")}`)
       if (t.agent) bits.push(`agent: ${t.agent}`)
       if (t.model) bits.push(`model: ${t.model}`)
+      if (t.priority) bits.push(`priority: ${t.priority}`)
       if (t.risk) bits.push(`risk: ${t.risk}`)
       lines.push(
         `  ${t.index}. [${t.checkedInSource ? "x" : " "}] ${t.title}${bits.length > 0 ? ` — ${bits.join(" | ")}` : ""}`,
@@ -95,7 +137,7 @@ export class Engine {
     })
     if (pairs.length > 0) {
       lines.push("")
-      lines.push(`File-conflict pairs (serialized): ${pairs.map(([a, b]) => `${a}~${b}`).join(", ")}`)
+      lines.push(`Serialized pairs: ${pairs.map(([a, b]) => `${a}~${b}`).join(", ")}`)
     }
     const noFiles = tasks.filter((t) => t.files.length === 0 && !t.checkedInSource)
     if (noFiles.length > 0) {
@@ -142,6 +184,33 @@ export class Engine {
     this.store.add(run)
     this.store.history(run, "started", `${tasks.length} task(s) from ${label}`, this.now())
     await this.persist()
+    this.emit({ type: "run.started", runID: run.id, detail: label })
+    await this.mirrorTitle(run)
+    this.launchLoop(run)
+    return run
+  }
+
+  /** Add tasks to the active run (from another checklist). */
+  async add(sessionID: string, source: string, label: string): Promise<RunState | undefined> {
+    const run = this.store.active(sessionID)
+    if (!run) return undefined
+    const { tasks } = parseChecklist(source)
+    const existing = this.byId(run)
+    for (const t of tasks) {
+      if (existing.has(t.id)) {
+        const suffix = `+${run.tasks.length + 1}`
+        t.id = `${t.id}${suffix}`
+      }
+      if (t.checkedInSource) {
+        t.status = "skipped"
+        t.evidence = "already checked in source"
+      }
+      run.tasks.push(t)
+    }
+    this.store.history(run, "added", `${tasks.length} task(s) from ${label}`, this.now())
+    if (run.status !== "running") this.store.setStatus(run, "running", "", this.now())
+    await this.persist()
+    this.emit({ type: "run.added", runID: run.id, detail: label })
     this.launchLoop(run)
     return run
   }
@@ -152,9 +221,17 @@ export class Engine {
     if (run.status === "completed" || run.status === "aborted") return run
     this.clearWaits(run)
     for (const t of run.tasks) {
-      if (t.status === "running" || t.status === "verifying") {
-        t.status = "pending"
+      // Dispose any session kept alive (blocked-for-answer) or left over from a crash.
+      if (t.sessionID) {
+        await this.safeDispose(t.sessionID)
         t.sessionID = undefined
+      }
+      if (t.integrated || t.status === "done") {
+        t.status = "done"
+        continue
+      }
+      if (t.status === "running" || t.status === "verifying" || t.status === "review") {
+        t.status = "pending"
       }
       if (t.status === "failed" || t.status === "blocked") {
         t.status = "pending"
@@ -168,6 +245,7 @@ export class Engine {
     }
     this.store.setStatus(run, "running", "", this.now())
     await this.persist()
+    await this.mirrorTitle(run)
     this.launchLoop(run)
     return run
   }
@@ -177,20 +255,17 @@ export class Engine {
     if (!run) return undefined
     this.clearWaits(run)
     for (const t of run.tasks) {
-      if ((t.status === "running" || t.status === "verifying") && t.sessionID) {
-        try {
-          await this.port.disposeWorker(t.sessionID)
-        } catch {
-          // ignore
-        }
-      }
-      if (t.status === "running" || t.status === "verifying") {
-        t.status = "pending"
+      if (t.sessionID) {
+        await this.safeDispose(t.sessionID)
         t.sessionID = undefined
+      }
+      if (t.status === "running" || t.status === "verifying" || t.status === "review") {
+        t.status = "pending"
       }
     }
     this.store.setStatus(run, "aborted", "user aborted", this.now())
     await this.persist()
+    await this.mirrorTitle(run)
     return run
   }
 
@@ -216,6 +291,59 @@ export class Engine {
     await this.persist()
     this.launchLoop(run)
     return true
+  }
+
+  /** Approve a task held at the approval gate and integrate it. */
+  async approve(sessionID: string, taskID: string): Promise<boolean> {
+    const run = this.store.active(sessionID)
+    if (!run) return false
+    const task = this.byId(run).get(taskID)
+    if (!task || task.status !== "review") return false
+    task.status = "done"
+    task.endedAt = this.now()
+    this.store.history(run, "approved", taskID, this.now())
+    await this.integrate(run, task)
+    this.store.setStatus(run, "running", "", this.now())
+    await this.persist()
+    this.emit({ type: "task.approved", runID: run.id, taskID })
+    this.launchLoop(run)
+    return true
+  }
+
+  async reject(sessionID: string, taskID: string, reason: string): Promise<boolean> {
+    const run = this.store.active(sessionID)
+    if (!run) return false
+    const task = this.byId(run).get(taskID)
+    if (!task || task.status !== "review") return false
+    task.status = "blocked"
+    task.lastError = `rejected: ${reason}`
+    task.endedAt = this.now()
+    this.store.history(run, "rejected", `${taskID}: ${summarize(reason, 160)}`, this.now())
+    this.store.setStatus(run, "running", "", this.now())
+    await this.persist()
+    this.emit({ type: "task.rejected", runID: run.id, taskID, detail: reason })
+    this.launchLoop(run)
+    return true
+  }
+
+  /** Send a message to every running worker. Returns how many were reached. */
+  async broadcast(sessionID: string, text: string): Promise<number> {
+    const run = this.store.active(sessionID)
+    if (!run) return 0
+    let count = 0
+    for (const t of run.tasks) {
+      if (t.status === "running" && t.sessionID) {
+        try {
+          await this.port.sendWorkerMessage(t.sessionID, `${CONTROL_MARKER} orchestrator: ${text}`)
+          count += 1
+        } catch (err) {
+          await this.port.log("warn", "broadcast failed", { task: t.id, error: String(err) })
+        }
+      }
+    }
+    if (count > 0) this.store.history(run, "broadcast", summarize(text, 120), this.now())
+    await this.persist()
+    return count
   }
 
   // ---- the loop ---------------------------------------------------------
@@ -286,7 +414,7 @@ export class Engine {
       const skipped = propagateSkips(run.tasks)
       if (skipped.length > 0) this.store.history(run, "skipped", skipped.join(", "), this.now())
 
-      const batch = nextBatch(run.tasks, run.maxConcurrency)
+      const batch = nextBatch(run.tasks, run.maxConcurrency, this.conflictExtra())
       for (const id of batch) await this.launch(run, id)
       await this.persist()
 
@@ -302,7 +430,9 @@ export class Engine {
           if (bad.length > 0) this.store.setStatus(run, "failed", `${bad.length} task(s) not completed`, this.now())
           else this.store.setStatus(run, "completed", "all tasks done", this.now())
           await this.port.notify(`Sub-worker run ${run.status}.`)
+          this.emit({ type: `run.${run.status}`, runID: run.id })
         }
+        await this.mirrorTitle(run)
         await this.persist()
         break
       }
@@ -316,6 +446,7 @@ export class Engine {
       const outcome = await Promise.race(entries.map(([, p]) => p))
       this.waits.delete(this.wkey(run, { id: outcome.taskID } as Task))
       await this.processFinished(run, outcome.taskID, outcome.timedOut)
+      await this.mirrorTitle(run)
       await this.persist()
     }
 
@@ -339,31 +470,34 @@ export class Engine {
   private async launch(run: RunState, id: string): Promise<void> {
     const task = this.byId(run).get(id)
     if (!task) return
+    if (task.integrated) {
+      task.status = "done"
+      return
+    }
 
     let directory = this.port.baseDirectory
     let isolated = false
     let worktree = task.worktree
-    if (this.options.useWorktrees) {
-      if (!worktree) {
-        try {
-          const wt = await this.port.createWorktree(`t-${task.id}`)
-          worktree = wt.directory
-        } catch (err) {
-          worktree = undefined
-          if (this.options.requireWorktrees) {
-            await this.handleFailure(run, task, `worktree required but unavailable: ${String(err)}`)
-            return
-          }
-          await this.port.log("warn", "worktree creation failed; running in place", {
-            task: task.id,
-            error: String(err),
-          })
+    if (this.options.useWorktrees && !worktree) {
+      try {
+        const wt = await this.port.createWorktree(`t-${task.id}`)
+        worktree = wt.directory
+        if (wt.branch) task.branch = wt.branch
+      } catch (err) {
+        worktree = undefined
+        if (this.options.requireWorktrees) {
+          await this.handleFailure(run, task, `worktree required but unavailable: ${String(err)}`)
+          return
         }
+        await this.port.log("warn", "worktree creation failed; running in place", {
+          task: task.id,
+          error: String(err),
+        })
       }
-      if (worktree) {
-        directory = worktree
-        isolated = true
-      }
+    }
+    if (worktree) {
+      directory = worktree
+      isolated = true
     }
     task.worktree = worktree
 
@@ -377,12 +511,13 @@ export class Engine {
     }
     const agent = task.agent ?? this.options.workerAgent
     if (agent.length > 0) spec.agent = agent
-    const modelRef = resolveModelRef(this.options, task.model, task.agent)
+    const modelRef = task.modelOverride ?? resolveModelRef(this.options, task.model, task.agent)
     const model = parseModelRef(modelRef)
     if (model) spec.model = model
     const permissions = this.buildPermissions(task)
     if (permissions) spec.permissions = permissions
 
+    task.worktree = worktree
     try {
       const handle = await this.port.spawnWorker(spec)
       task.sessionID = handle.sessionID
@@ -396,6 +531,7 @@ export class Engine {
         `${task.id}${isolated ? ` (worktree ${directory})` : ""}`,
         this.now(),
       )
+      this.emit({ type: "task.launched", runID: run.id, taskID: task.id })
       this.setWaiter(run, task)
     } catch (err) {
       await this.handleFailure(run, task, `failed to spawn worker: ${String(err)}`)
@@ -429,14 +565,14 @@ export class Engine {
     } catch {
       // usage is best-effort
     }
-    const outcome = parseWorkerOutcome(text)
-    const report =
+
+    const report = parseWorkerReport(text)
+    const toolReport =
       task.reports !== undefined && task.reports.length > 0 ? task.reports[task.reports.length - 1] : undefined
 
-    if (outcome.kind === "blocked" || report?.status === "blocked") {
-      const reason = outcome.blocker || report?.text || "worker reported blocked"
+    if (report.status === "blocked" || toolReport?.status === "blocked") {
+      const reason = report.blocker || toolReport?.text || "worker reported blocked"
       if (this.options.askUserOnBlocked) {
-        // Keep the session alive so an answer can resume it.
         await this.terminalTask(run, task, "blocked", reason, true)
       } else {
         await this.safeDispose(sessionID)
@@ -446,8 +582,11 @@ export class Engine {
       return
     }
 
+    // Collect the changed files once: used for the diff-scope check and learning.
+    let changed: string[] = []
+    if (task.worktree) changed = await this.changedFiles(task.worktree)
+
     if (this.options.enforceDiffScope && task.files.length > 0 && task.worktree) {
-      const changed = await this.changedFiles(task.worktree)
       const violations = changed.filter((f) => !matchesAny(task.files, f))
       if (violations.length > 0) {
         task.scopeViolations = violations
@@ -466,12 +605,17 @@ export class Engine {
         directory: task.worktree ?? this.port.baseDirectory,
         timeoutMs: this.options.verifyTimeoutMs,
       })
+      task.gateOutput = gate.output
       if (!gate.ok) {
-        await this.safeDispose(sessionID)
-        task.sessionID = undefined
         const why = gate.timedOut
           ? `gate timed out: ${summarize(gate.output, 300)}`
           : `gate failed (exit ${gate.exitCode ?? "?"}): ${summarize(gate.output, 300)}`
+        if (this.options.repairOnFailure && task.sessionID && (task.repairs ?? 0) < this.options.maxAttempts) {
+          await this.repair(run, task, gate.output || why)
+          return
+        }
+        await this.safeDispose(sessionID)
+        task.sessionID = undefined
         await this.handleFailure(run, task, why)
         return
       }
@@ -480,6 +624,10 @@ export class Engine {
     if (this.options.verifierEnabled) {
       const verdict = await this.runVerifier(run, task)
       if (!verdict.ok) {
+        if (this.options.repairOnFailure && task.sessionID && (task.repairs ?? 0) < this.options.maxAttempts) {
+          await this.repair(run, task, verdict.reason)
+          return
+        }
         await this.safeDispose(sessionID)
         task.sessionID = undefined
         await this.handleFailure(run, task, `verifier rejected: ${summarize(verdict.reason, 300)}`)
@@ -487,13 +635,43 @@ export class Engine {
       }
     }
 
-    task.status = "done"
-    task.endedAt = this.now()
-    task.evidence = outcome.evidence || report?.text || (task.verify ? "gate passed" : "completed")
     await this.safeDispose(sessionID)
     task.sessionID = undefined
+    task.evidence = report.evidence || report.note || toolReport?.text || (task.verify ? "gate passed" : "completed")
+    if (this.options.coChangeLearning && changed.length > 0) this.cochange.record(changed)
+
+    if (this.approvalRequired(task)) {
+      task.status = "review"
+      this.store.history(run, "review", `${task.id} awaiting approval (risk ${task.risk})`, this.now())
+      this.store.setStatus(run, "paused", `awaiting approval for ${task.id}`, this.now())
+      this.emit({ type: "task.review", runID: run.id, taskID: task.id })
+      await this.port.notify(
+        `Sub-worker awaiting approval for ${task.id} (risk: ${task.risk ?? "?"}) — /tasks approve ${task.id} or /tasks reject ${task.id} <reason>`,
+      )
+      return
+    }
+
+    task.status = "done"
+    task.endedAt = this.now()
     this.store.history(run, "done", `${task.id}: ${summarize(task.evidence, 160)}`, this.now())
+    this.emit({ type: "task.done", runID: run.id, taskID: task.id })
     await this.integrate(run, task)
+  }
+
+  private async repair(run: RunState, task: Task, failure: string): Promise<void> {
+    if (!task.sessionID) return
+    task.repairs = (task.repairs ?? 0) + 1
+    task.gateOutput = failure
+    try {
+      await this.port.sendWorkerMessage(task.sessionID, buildRepairPrompt(task, failure))
+    } catch (err) {
+      await this.port.log("warn", "repair steer failed", { task: task.id, error: String(err) })
+    }
+    task.status = "running"
+    task.startedAt = this.now()
+    this.store.history(run, "repair", `${task.id} #${task.repairs}`, this.now())
+    this.emit({ type: "task.repair", runID: run.id, taskID: task.id, detail: `#${task.repairs}` })
+    this.setWaiter(run, task)
   }
 
   private async runVerifier(run: RunState, task: Task): Promise<{ ok: boolean; reason: string }> {
@@ -511,10 +689,9 @@ export class Engine {
       await this.port.waitWorker(handle.sessionID)
       const text = await this.port.readWorkerOutcome(handle.sessionID)
       await this.safeDispose(handle.sessionID)
-      const verdict = parseWorkerOutcome(text)
-      if (verdict.kind === "blocked") return { ok: false, reason: verdict.blocker || "verifier rejected" }
-      if (verdict.kind === "done") return { ok: true, reason: verdict.evidence }
-      return { ok: true, reason: "verifier produced no verdict" }
+      const report = parseWorkerReport(text)
+      if (report.status === "blocked") return { ok: false, reason: report.blocker || "verifier rejected" }
+      return { ok: true, reason: report.evidence ?? "verified" }
     } catch (err) {
       await this.port.log("warn", "verifier session failed; treating as pass", { error: String(err) })
       return { ok: true, reason: "verifier unavailable" }
@@ -531,11 +708,11 @@ export class Engine {
   }
 
   private async integrate(run: RunState, task: Task): Promise<void> {
+    if (task.integrated) return
     if (task.worktree) {
       if (this.options.commitBeforeMerge) {
         const commit = await this.port.commitWorktree(task.worktree, `sub-worker: ${task.id} ${task.title}`)
         if (!commit.ok) {
-          // A clean tree is fine (nothing to commit); a real failure is not.
           await this.port.log("info", "commit skipped", { task: task.id, output: summarize(commit.output, 200) })
         }
       }
@@ -546,18 +723,22 @@ export class Engine {
           return
         }
         this.store.history(run, "merged", task.id, this.now())
+        task.integrated = true
+        if (this.options.cleanupWorktrees) {
+          try {
+            await this.port.removeWorktree(task.worktree, true)
+          } catch (err) {
+            await this.port.log("warn", "worktree cleanup failed", { task: task.id, error: String(err) })
+          }
+          task.worktree = undefined
+        }
+      } else {
+        // autoMerge is off: keep the worktree so the change can be reviewed.
+        task.integrated = true
+        this.store.history(run, "worktree-kept", `${task.id}: ${task.worktree}`, this.now())
       }
-    }
-    if (this.options.cleanupWorktrees && run.autoMerge && task.worktree) {
-      try {
-        await this.port.removeWorktree(task.worktree, true)
-      } catch (err) {
-        await this.port.log("warn", "worktree cleanup failed", { task: task.id, error: String(err) })
-      }
-      task.worktree = undefined
-    } else if (task.worktree) {
-      // autoMerge is off: keep the worktree so the change can be reviewed.
-      this.store.history(run, "worktree-kept", `${task.id}: ${task.worktree}`, this.now())
+    } else {
+      task.integrated = true
     }
   }
 
@@ -567,6 +748,14 @@ export class Engine {
     if (task.attempts < this.options.maxAttempts) {
       task.status = "pending"
       task.sessionID = undefined
+      // Rotate to the next fallback model, if configured.
+      const fb = this.options.fallbackModels
+      if (fb.length > 0) {
+        const current = task.modelOverride ?? task.model
+        const idx = current !== undefined ? fb.indexOf(current) : -1
+        const next = idx + 1 < fb.length ? fb[idx + 1] : fb[0]
+        if (next) task.modelOverride = next
+      }
       if (this.options.freshWorktreeOnRetry && task.worktree) {
         try {
           await this.port.removeWorktree(task.worktree, true)
@@ -578,7 +767,7 @@ export class Engine {
       this.store.history(
         run,
         "retry",
-        `${task.id} attempt ${task.attempts}: ${summarize(reason, 200)}`,
+        `${task.id} attempt ${task.attempts}: ${summarize(reason, 200)}${task.modelOverride ? ` (model ${task.modelOverride})` : ""}`,
         this.now(),
       )
       return
@@ -597,6 +786,7 @@ export class Engine {
     task.lastError = reason
     task.endedAt = this.now()
     this.store.history(run, status, `${task.id}: ${summarize(reason, 200)}`, this.now())
+    this.emit({ type: `task.${status}`, runID: run.id, taskID: task.id, detail: summarize(reason, 200) })
 
     if (this.options.continueOnError) return
 
@@ -670,6 +860,55 @@ export class Engine {
     return true
   }
 
+  // ---- per-task views ---------------------------------------------------
+
+  async diffText(sessionID: string, taskID: string): Promise<string> {
+    const run = this.store.active(sessionID)
+    if (!run) return "No active task run."
+    const task = this.byId(run).get(taskID)
+    if (!task) return `No task "${taskID}".`
+    if (!task.worktree) {
+      const changed = await this.changedFiles(this.port.baseDirectory)
+      if (changed.length === 0) return `Task ${taskID} has no isolated worktree and no changed files were detected.`
+      return `Task ${taskID} ran in place. Changed files:\n${changed.map((f) => `  ${f}`).join("\n")}`
+    }
+    try {
+      const diff = await this.port.worktreeDiff(task.worktree)
+      const header = `Diff for ${taskID}${task.branch ? ` (branch ${task.branch})` : ""}:`
+      return `${header}\n${diff}`
+    } catch (err) {
+      return `Could not read the diff for ${taskID}: ${String(err)}`
+    }
+  }
+
+  logsText(sessionID: string, taskID: string): string {
+    const run = this.store.active(sessionID)
+    if (!run) return "No active task run."
+    const task = this.byId(run).get(taskID)
+    if (!task) return `No task "${taskID}".`
+    const lines: string[] = []
+    lines.push(`Task ${task.id}: ${task.title}`)
+    lines.push(`Status: ${task.status}`)
+    if (task.branch) lines.push(`Branch: ${task.branch}`)
+    if (task.worktree) lines.push(`Worktree: ${task.worktree}`)
+    lines.push(`Attempts: ${task.attempts}   repairs: ${task.repairs ?? 0}`)
+    if (task.cost !== undefined) lines.push(`Cost: $${task.cost.toFixed(4)}   tokens: ${task.tokens ?? 0}`)
+    if (task.evidence) lines.push(`Evidence: ${task.evidence}`)
+    if (task.lastError) lines.push(`Last error: ${task.lastError}`)
+    if (task.gateOutput) {
+      lines.push("")
+      lines.push("Gate output:")
+      lines.push(task.gateOutput.slice(-4000))
+    }
+    const related = run.history.filter((h) => h.detail.includes(task.id) || h.detail.includes(task.title))
+    if (related.length > 0) {
+      lines.push("")
+      lines.push("History:")
+      for (const h of related.slice(-20)) lines.push(`  - ${h.type}: ${h.detail}`)
+    }
+    return lines.join("\n")
+  }
+
   // ---- reporting --------------------------------------------------------
 
   statusText(sessionID: string): string {
@@ -681,7 +920,7 @@ export class Engine {
     lines.push(`Source: ${run.sourceLabel}`)
     lines.push(`Status: ${run.status}${run.stopReason ? ` (${run.stopReason})` : ""}`)
     lines.push(
-      `Tasks: ${run.tasks.length}  done=${counts.done} running=${counts.running} pending=${counts.pending} failed=${counts.failed} blocked=${counts.blocked} skipped=${counts.skipped}`,
+      `Tasks: ${run.tasks.length}  done=${counts.done} running=${counts.running} review=${counts.review} pending=${counts.pending} failed=${counts.failed} blocked=${counts.blocked} skipped=${counts.skipped}`,
     )
     lines.push(`Max concurrency: ${run.maxConcurrency}   autoMerge: ${run.autoMerge}`)
     const budgetBits: string[] = [`$${run.cost.toFixed(4)}`]
@@ -693,8 +932,11 @@ export class Engine {
     for (const t of run.tasks) {
       const mark = statusMark(t.status)
       const extras: string[] = []
-      if (t.worktree) extras.push("worktree")
+      if (t.branch) extras.push(`branch ${t.branch}`)
+      else if (t.worktree) extras.push("worktree")
+      if (t.priority) extras.push(`prio ${t.priority}`)
       if (t.attempts > 0) extras.push(`attempts=${t.attempts}`)
+      if (t.repairs) extras.push(`repairs=${t.repairs}`)
       if (t.cost !== undefined && t.cost > 0) extras.push(`$${t.cost.toFixed(4)}`)
       lines.push(`  ${mark} ${t.index}. ${t.title} [${t.status}]${extras.length > 0 ? ` (${extras.join(", ")})` : ""}`)
       if (t.lastError) lines.push(`      ! ${summarize(t.lastError, 200)}`)
@@ -725,6 +967,7 @@ export class Engine {
     if (!this.options.persistState) return
     try {
       await this.port.storage.set("state", this.store.serialize())
+      if (this.options.coChangeLearning) await this.port.storage.set("cochange", this.cochange.serialize())
     } catch (err) {
       await this.port.log("error", "failed to persist run state", { error: String(err) })
     }
@@ -735,6 +978,9 @@ export class Engine {
     try {
       const snapshot = await this.port.storage.get("state")
       this.store.load(snapshot as Parameters<RunStore["load"]>[0])
+      if (this.options.coChangeLearning) {
+        this.cochange.load(await this.port.storage.get("cochange"))
+      }
     } catch (err) {
       await this.port.log("warn", "failed to load run state", { error: String(err) })
     }
@@ -744,6 +990,45 @@ export class Engine {
     const run = this.store.active(sessionID)
     return run && run.status === "paused" && run.stopReason === "recovered after restart" ? run : undefined
   }
+
+  /** Snapshot of the active run for RPC/observability clients. */
+  snapshot(sessionID: string): Record<string, unknown> | undefined {
+    const run = this.store.active(sessionID)
+    if (!run) return undefined
+    const counts = tally(run.tasks)
+    return {
+      runID: run.id,
+      source: run.sourceLabel,
+      status: run.status,
+      stopReason: run.stopReason,
+      cost: run.cost,
+      tokens: run.tokens,
+      counts,
+      tasks: run.tasks.map((t) => ({
+        id: t.id,
+        title: t.title,
+        status: t.status,
+        priority: t.priority ?? 0,
+        branch: t.branch,
+        attempts: t.attempts,
+        repairs: t.repairs ?? 0,
+        risk: t.risk,
+      })),
+    }
+  }
+
+  private async mirrorTitle(run: RunState): Promise<void> {
+    if (!this.options.mirrorSessionTitles) return
+    const counts = tally(run.tasks)
+    const icon =
+      run.status === "completed" ? "✅" : run.status === "failed" || run.status === "paused" ? "⏸" : "▶"
+    const title = `${icon} tasks ${counts.done + counts.skipped}/${run.tasks.length} · ${run.status}`
+    try {
+      await this.port.setSessionTitle(run.sessionID, title)
+    } catch {
+      // cosmetic only
+    }
+  }
 }
 
 function tally(tasks: Task[]): Record<Task["status"], number> {
@@ -751,6 +1036,7 @@ function tally(tasks: Task[]): Record<Task["status"], number> {
     pending: 0,
     running: 0,
     verifying: 0,
+    review: 0,
     done: 0,
     failed: 0,
     blocked: 0,
@@ -768,6 +1054,8 @@ function statusMark(status: Task["status"]): string {
       return ">"
     case "verifying":
       return "?"
+    case "review":
+      return "@"
     case "failed":
       return "!"
     case "blocked":

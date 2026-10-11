@@ -2,14 +2,18 @@
  * Dependency graph and conflict model.
  *
  * Conflicts are pairwise and symmetric: two tasks conflict when they share a
- * declared file, or when either side declares no files at all (an unknown write
- * set is never allowed to run concurrently).
+ * declared file (glob-aware), share a named lock, or when either side declares
+ * no files at all (an unknown write set is never allowed to run concurrently).
+ * An optional `extra` predicate lets the caller add learned conflicts (for
+ * example, git co-change history).
  */
 
 import type { Graph, SchedulePreview, Task, Wave } from "./types.ts"
 import { specConflicts } from "./glob.ts"
 
-export function conflicts(a: Task, b: Task): boolean {
+export type ConflictPredicate = (a: Task, b: Task) => boolean
+
+export function conflicts(a: Task, b: Task, extra?: ConflictPredicate): boolean {
   if (a.id === b.id) return false
   if (a.files.length === 0 || b.files.length === 0) return true
   for (const fa of a.files) {
@@ -17,10 +21,15 @@ export function conflicts(a: Task, b: Task): boolean {
       if (specConflicts(fa, fb)) return true
     }
   }
+  if (a.locks !== undefined && b.locks !== undefined) {
+    const set = new Set(b.locks)
+    if (a.locks.some((l) => set.has(l))) return true
+  }
+  if (extra && extra(a, b)) return true
   return false
 }
 
-export function buildGraph(tasks: Task[]): Graph {
+export function buildGraph(tasks: Task[], extra?: ConflictPredicate): Graph {
   const byId = new Map<string, Task>()
   for (const t of tasks) byId.set(t.id, t)
   const conflictsList: Array<[string, string]> = []
@@ -28,7 +37,7 @@ export function buildGraph(tasks: Task[]): Graph {
     for (let j = i + 1; j < tasks.length; j++) {
       const a = tasks[i]!
       const b = tasks[j]!
-      if (conflicts(a, b)) conflictsList.push([a.id, b.id])
+      if (conflicts(a, b, extra)) conflictsList.push([a.id, b.id])
     }
   }
   return { byId, conflicts: conflictsList }
@@ -69,7 +78,7 @@ export function findCycle(tasks: Task[]): string[] {
  * runtime schedule (the runtime scheduler is opportunistic and bounded by
  * maxConcurrency).
  */
-export function previewWaves(tasks: Task[]): SchedulePreview {
+export function previewWaves(tasks: Task[], extra?: ConflictPredicate): SchedulePreview {
   const cycle = findCycle(tasks)
   const done = new Set<string>()
   for (const t of tasks) if (t.checkedInSource) done.add(t.id)
@@ -86,7 +95,7 @@ export function previewWaves(tasks: Task[]): SchedulePreview {
       const t = byId.get(id)
       if (!t) continue
       if (!t.deps.every((d) => done.has(d))) continue
-      if (wave.some((w) => conflicts(w, t))) continue
+      if (wave.some((w) => conflicts(w, t, extra))) continue
       wave.push(t)
     }
     if (wave.length === 0) break // deadlock or unsatisfiable preview
@@ -97,5 +106,5 @@ export function previewWaves(tasks: Task[]): SchedulePreview {
     waves.push({ index: waves.length + 1, taskIDs: wave.map((t) => t.id) })
   }
 
-  return { waves, conflicts: buildGraph(tasks).conflicts, cycle }
+  return { waves, conflicts: buildGraph(tasks, extra).conflicts, cycle }
 }

@@ -74,11 +74,13 @@ least as far as the task, with or without a bullet.
 |---|---|
 | `id` | Stable id. Defaults to `t1`, `t2`, … (by position). |
 | `files` | Comma-separated write scope. **Empty ⇒ never parallel.** |
+| `locks` | Comma-separated exclusive named resources (e.g. `db-migration, staging`). |
+| `priority` | Higher runs first among ready tasks. Default `0`. |
 | `verify` | Shell command that must pass. `false`/`no`/`none`/`-` disables the gate. |
 | `deps` | Comma-separated dependencies — a 1-based item number or an `id`. |
 | `agent` | Worker agent id. Overrides the plugin default. |
 | `model` | `provider/model[#variant]` for this task. Overrides the role map and default. |
-| `risk` | Free text, informational only. |
+| `risk` | Free text; a value listed in `approvalRisks` holds the task for approval. |
 | `timeout` | Per-task timeout (`30s`, `5m`, `600000`). |
 
 Already-checked (`- [x]`) items are treated as done and satisfy dependents.
@@ -91,13 +93,16 @@ Example: [`examples/tasks.example.md`](examples/tasks.example.md).
 |---|---|
 | `/tasks plan <file\|markdown>` | Parse and preview the dependency/conflict schedule. No execution. |
 | `/tasks run <file\|markdown>` | Start the run. |
+| `/tasks add <file\|markdown>` | Add tasks to the active run. |
 | `/tasks status` | Task statuses and recent activity. |
 | `/tasks list` | One-line summary. |
-| `/tasks resume` | Resume a paused run (resets failed/blocked tasks for another attempt). |
-| `/tasks abort` | Stop the run and its running workers. |
-| `/tasks answer <id> <text>` | Answer a blocked worker and continue it (human-in-the-loop). |
-| `taskforce_plan` / `taskforce_run` / `taskforce_status` / `taskforce_resume` / `taskforce_abort` / `taskforce_answer` | The same actions as model tools. |
-| `taskforce_send` | Orchestrator → worker message (mailbox). |
+| `/tasks diff <taskID>` | Show a task's worktree diff. |
+| `/tasks logs <taskID>` | Show a task's status, branch, gate output and history. |
+| `/tasks approve <taskID>` / `reject <taskID> <reason>` | Resolve a task held at the approval gate. |
+| `/tasks answer <taskID> <text>` | Answer a blocked worker and continue it. |
+| `/tasks broadcast <text>` | Message every running worker. |
+| `/tasks resume` / `abort` | Resume a paused run / stop the run. |
+| `taskforce_plan` / `taskforce_run` / `taskforce_add` / `taskforce_status` / `taskforce_resume` / `taskforce_abort` / `taskforce_answer` / `taskforce_approve` / `taskforce_reject` / `taskforce_diff` / `taskforce_logs` / `taskforce_send` / `taskforce_broadcast` | The same actions as model tools. |
 | `worker_report` / `worker_inbox` | Worker-side tools for the mailbox. |
 
 ## Options
@@ -117,10 +122,12 @@ Plugin-level options (V2 object form):
         "maxAttempts": 2,
         "freshWorktreeOnRetry": false,
         "continueOnError": false,
+        "repairOnFailure": true,
         "workerAgent": "subworker",
         "installWorkerAgent": true,
         "workerModel": "anthropic/claude-sonnet-4-5",
         "roleModels": { "reviewer": "anthropic/claude-sonnet-4-5" },
+        "fallbackModels": ["openai/gpt-4o-mini"],
         "useWorktrees": true,
         "requireWorktrees": true,
         "autoMerge": true,
@@ -128,6 +135,10 @@ Plugin-level options (V2 object form):
         "cleanupWorktrees": true,
         "enforceWriteScope": true,
         "enforceDiffScope": true,
+        "approvalRisks": ["high"],
+        "coChangeLearning": false,
+        "coChangeMinCount": 2,
+        "mirrorSessionTitles": false,
         "verifierEnabled": false,
         "verifierAgent": "explore",
         "askUserOnBlocked": false,
@@ -150,10 +161,12 @@ Plugin-level options (V2 object form):
 | `maxAttempts` | `2` | Attempts per task before the run pauses. |
 | `freshWorktreeOnRetry` | `false` | Start a retry from a clean worktree instead of continuing in place. |
 | `continueOnError` | `false` | A failed/blocked task pauses the whole run; set `true` to let independent work continue. |
+| `repairOnFailure` | `true` | On a failed gate, steer the failure back to the same worker to repair it before counting an attempt. |
 | `workerAgent` | `subworker` | Worker agent id. |
 | `installWorkerAgent` | `true` | Write `.opencode/agents/<workerAgent>.md` on setup. |
 | `workerModel` | `""` | `provider/model[#variant]` for workers. Empty = inherit. |
 | `roleModels` | `{}` | Per-agent model overrides keyed by the task's `agent:` value. |
+| `fallbackModels` | `[]` | Ordered model references tried on retry after a failure. |
 | `useWorktrees` | `true` | One `git worktree` per worker. |
 | `requireWorktrees` | `true` | If a worktree cannot be created, fail the task instead of running in place. |
 | `autoMerge` | `true` | Merge each finished worker's branch back. |
@@ -161,6 +174,10 @@ Plugin-level options (V2 object form):
 | `cleanupWorktrees` | `true` | Remove worktrees after integration. |
 | `enforceWriteScope` | `true` | Deny edits outside `files:` at the session-permission level. |
 | `enforceDiffScope` | `true` | After a worker finishes, fail it if it touched undeclared files. |
+| `approvalRisks` | `[]` | Risk labels (case-insensitive) that hold a task for `/tasks approve`/`reject` before integrating. |
+| `coChangeLearning` | `false` | Learn file pairs that change together and treat them as conflicts. |
+| `coChangeMinCount` | `2` | Co-change count before a learned pair conflicts. |
+| `mirrorSessionTitles` | `false` | Mirror run status into the orchestrator session title. |
 | `verifierEnabled` | `false` | Run an independent read-only verifier session after the gate. |
 | `verifierAgent` | `explore` | Agent id used for the verifier. |
 | `askUserOnBlocked` | `false` | Keep a blocked worker alive and wait for `/tasks answer`. |
@@ -209,6 +226,50 @@ and the run pauses with `awaiting answer`. Reply with:
 
 The answer is steered into the same worker, which resumes and finishes its task.
 
+## Repair loop
+
+By default (`repairOnFailure: true`), when a task's verification command fails the
+failure output is **steered back into the same worker**, which keeps its context
+and fixes the problem in place. Only if it still fails after `maxAttempts` is the
+task marked failed and the run paused. Set it to `false` for the old
+fail-and-retry-from-scratch behavior.
+
+## Approval gate
+
+List risky labels in `approvalRisks` (for example `["high"]`). A task whose
+`risk:` matches still runs and is gated, but before its branch is integrated the
+run pauses with the task in `review`:
+
+```
+/tasks approve t3            # integrate it
+/tasks reject t3 not safe    # block it
+```
+
+## Named locks, priority and co-change learning
+
+- `locks:` declares exclusive named resources beyond files (a database, an
+  environment, a port). Tasks sharing a lock are serialized.
+- `priority:` (higher first) orders ready tasks.
+- With `coChangeLearning: true`, the plugin records which files changed together
+  across completed tasks and treats a learned pair (>= `coChangeMinCount`) as a
+  conflict, so files that historically move together are not edited in
+  parallel.
+
+## RPC and the CLI plugin
+
+The package exposes an RPC contract at `opencode-sub-worker/rpc` with a `status`
+method and `progress` events (emitted on every task/run transition), so other
+plugins and clients can observe a run over HTTP.
+
+It also exports a CLI plugin at `opencode-sub-worker/tui`: a "Task force status"
+palette / `/tasks` command that reads the run over RPC, plus attention
+notifications when a task or run finishes or fails. It renders nothing, so it
+needs no OpenTUI/solid dependency.
+
+```jsonc title="cli.json"
+{ "plugins": ["opencode-sub-worker"] }
+```
+
 ## Worker agent
 
 A plugin cannot register a new agent through `agent.transform` (there is no
@@ -234,13 +295,16 @@ resumes blindly) and can be restarted with `/tasks resume`.
 ## Limitations (read these)
 
 - **V2 only.** There is no V1 adapter.
-- **Markers, not tools, are the durable contract.** A worker runs in its own
+- **The report, not a tool, is the durable contract.** A worker runs in its own
   worktree *location*; tools registered for the orchestrator's location may not
-  be visible there. So completion is read from the end of the worker's final
-  message; `worker_report` is a best-effort enhancement.
-- **The gate, the verifier and `git` run in the server process** via
+  be visible there. So completion is read from a fenced JSON report at the end of
+  the worker's final message (`[task:done]`/`[task:blocked]` markers are the
+  fallback); `worker_report` is a best-effort enhancement.
+- **The gate, the verifier, the diff and `git` run in the server process** via
   `child_process`, not through OpenCode's permission system. Plugins are trusted
   code; keep that in mind.
+- **`repairOnFailure` reuses the same worktree and session**, so a repair keeps
+  the worker's context — and any partial edits — rather than starting clean.
 - **`enforceWriteScope` is strict by design.** A worker that needs to touch an
   undeclared file (say, a lockfile) will be refused and should report blocked.
   Declare the file or disable the option.
@@ -249,11 +313,18 @@ resumes blindly) and can be restarted with `/tasks resume`.
   excluded by `.gitignore`, are not.
 - **Merging assumes Git and a branch per worktree.** `createWorktree` requires a
   Git repository. If your default worktree strategy does not create a branch,
-  `mergeWorktree` reports a failure and the run pauses. Set `autoMerge: false`
-  to keep worktrees for manual review instead.
+  `mergeWorktree` reports a failure and the run pauses. With `autoMerge: false`
+  the worktree is kept for review instead (and recorded in the run history).
+- **Co-change learning is a heuristic.** It only ever *adds* conflicts, so it can
+  over-serialize; the learned pairs persist in plugin storage.
 - **`continueOnError` still marks dependents of a failed task as skipped.**
 - **`askUserOnBlocked` keeps a session alive** while the run is paused; it is
   disposed when the run is aborted or resumed.
+- **The bundled CLI plugin renders nothing.** It adds a status command and
+  attention notifications; a full OpenTUI/solid JSX panel is a follow-up that
+  would add those peer dependencies.
+- **RPC status is per orchestrator session** and returns JSON; progress events
+  are live only (disconnected subscribers miss them).
 - **Not a sandbox.** Workers inherit the session's permissions except for the
   write-scope rules the plugin adds.
 

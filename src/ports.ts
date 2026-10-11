@@ -8,7 +8,6 @@ export interface WorktreeRef {
   /** Branch checked out in the worktree, when the adapter can determine it. */
   branch?: string
 }
-
 export interface PermissionRule {
   action: string
   resource: string
@@ -80,6 +79,10 @@ export interface HostPort {
   commitWorktree(directory: string, message: string): Promise<MergeResult>
   /** Files changed (staged, unstaged, untracked) in a directory. */
   changedFiles(directory: string): Promise<string[]>
+  /** Unified diff of a worktree's changes (tracked + a list of untracked files). */
+  worktreeDiff(directory: string): Promise<string>
+  /** Set a session title (cosmetic status mirroring). */
+  setSessionTitle(sessionID: string, title: string): Promise<void>
 
   /** Create and prompt a worker session. */
   spawnWorker(spec: WorkerSpec): Promise<WorkerHandle>

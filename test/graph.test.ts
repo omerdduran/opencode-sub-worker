@@ -75,3 +75,21 @@ test("previewWaves respects dependencies", () => {
   assert.deepEqual(waves[0]!.taskIDs, ["a"])
   assert.deepEqual(waves[1]!.taskIDs, ["b"])
 })
+
+test("shared named locks conflict even with disjoint files", () => {
+  const a = task({ id: "a", files: ["a.ts"] })
+  a.locks = ["db"]
+  const b = task({ id: "b", files: ["b.ts"] })
+  b.locks = ["db"]
+  assert.equal(conflicts(a, b), true)
+  assert.equal(conflicts(a, task({ id: "c", files: ["c.ts"] })), false)
+})
+
+test("an extra conflict predicate is consulted and serializes preview waves", () => {
+  const a = task({ id: "a", files: ["a.ts"] })
+  const b = task({ id: "b", files: ["b.ts"] })
+  assert.equal(conflicts(a, b), false)
+  assert.equal(conflicts(a, b, () => true), true)
+  const waves = previewWaves([a, b], () => true).waves
+  assert.equal(waves.length, 2)
+})
