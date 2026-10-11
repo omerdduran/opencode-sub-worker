@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/omerdduran/opencode-sub-worker/compare/v0.1.2...v0.2.0) (2026-10-11)
+
+
+### Features
+
+* repair loop, approval gate, locks/priority, RPC/CLI, co-change learning ([efc5652](https://github.com/omerdduran/opencode-sub-worker/commit/efc565287c68d619c48a5286231f0a01854e635d))
+
 ## [0.1.2](https://github.com/omerdduran/opencode-sub-worker/compare/v0.1.1...v0.1.2) (2026-10-11)
 
 
