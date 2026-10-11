@@ -318,6 +318,16 @@ Add a Trusted Publisher for the package on npmjs.com
 The workflow filename must match exactly (case-sensitive, `.yml` included) and
 the first publish must succeed within 2 days, otherwise the configuration expires.
 
+Or configure it from the CLI (after the first publish):
+
+```sh
+npm trust github opencode-sub-worker \
+  --file release.yml \
+  --repository omerdduran/opencode-sub-worker \
+  --allow-publish -y
+npm trust list opencode-sub-worker
+```
+
 ### Development requirements
 
 The published package is plain JavaScript, but the test suite imports the
