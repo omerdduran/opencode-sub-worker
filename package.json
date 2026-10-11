@@ -1,6 +1,6 @@
 {
   "name": "opencode-sub-worker",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Turn a markdown task checklist into a dependency- and file-conflict-aware schedule, run ready tasks in parallel as isolated child sessions in their own git worktrees, coordinate through an orchestrator-mediated mailbox, and gate every task with a verification command.",
   "type": "module",
   "main": "./dist/index.js",

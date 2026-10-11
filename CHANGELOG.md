@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/omerdduran/opencode-sub-worker/compare/v0.1.1...v0.1.2) (2026-10-11)
+
+
+### Bug Fixes
+
+* keep the worker worktree when autoMerge is off ([7031ad8](https://github.com/omerdduran/opencode-sub-worker/commit/7031ad8df8f96601850edc619363c785c0f8b53a))
+
 ## 0.1.1
 
 Initial release.
