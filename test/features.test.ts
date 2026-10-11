@@ -202,3 +202,16 @@ test("worker changes are committed before merging", async () => {
   assert.match(host.commits[0]!.message, /sub-worker: t1/)
   assert.equal(host.merged.length, 1)
 })
+
+test("the worktree is kept for review when autoMerge is off", async () => {
+  const host = new FakeHost()
+  const engine = new Engine(normalizeOptions({ maxConcurrency: 1, autoMerge: false }), host)
+  const run = await engine.start("s1", "- [ ] a\n  - files: a.txt", "inline")
+  await until(() => host.sessionForTask("t1") !== undefined, 3000, "worker")
+  host.finishTask("t1", "[task:done] a")
+  await until(() => run.status === "completed", 3000, "completed")
+  assert.equal(host.merged.length, 0)
+  assert.equal(host.worktrees.length, 1)
+  assert.ok(run.tasks[0]!.worktree, "the worktree path should be retained")
+  assert.ok(run.history.some((h) => h.type === "worktree-kept"))
+})

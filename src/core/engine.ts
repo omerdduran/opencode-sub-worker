@@ -548,13 +548,16 @@ export class Engine {
         this.store.history(run, "merged", task.id, this.now())
       }
     }
-    if (this.options.cleanupWorktrees && task.worktree) {
+    if (this.options.cleanupWorktrees && run.autoMerge && task.worktree) {
       try {
         await this.port.removeWorktree(task.worktree, true)
       } catch (err) {
         await this.port.log("warn", "worktree cleanup failed", { task: task.id, error: String(err) })
       }
       task.worktree = undefined
+    } else if (task.worktree) {
+      // autoMerge is off: keep the worktree so the change can be reviewed.
+      this.store.history(run, "worktree-kept", `${task.id}: ${task.worktree}`, this.now())
     }
   }
 
