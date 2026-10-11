@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/omerdduran/opencode-sub-worker/compare/v0.1.1...v0.2.0) (2026-10-11)
+
+
+### Features
+
+* initial release of opencode-sub-worker ([5ef3d42](https://github.com/omerdduran/opencode-sub-worker/commit/5ef3d42456bdebcf5b5605a16b945797522659c3))
+
 ## 0.1.1
 
 Initial release.
